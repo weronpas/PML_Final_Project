@@ -12,10 +12,31 @@ We are using the **NASA C-MAPSS** (Commercial Modular Aero-Propulsion System Sim
 * **Pandas, NumPy, Scikit-learn** (for data processing and evaluation)
 
 ## Repository Structure
-* `/data` - Contains the C-MAPSS dataset files
-* `/notebooks` - Jupyter notebooks for exploratory data analysis, plotting, and baseline testing.
-* `/src` - Source code for the SVGP models, physics-informed kernels, and online updating logic.
-* `requirements.txt` - Python dependencies required to run the project.
+pml-digital-twin/
+├── data/                   # Store data here
+│   ├── raw/                # Raw data downloaded directly from NASA
+│   └── processed/          # Data after cleaning and normalization
+├── notebooks/              
+│   ├── 01_eda.ipynb        # Exploratory Data Analysis
+│   └── 02_svgp_poc.ipynb   # Proof of Concept for the model
+├── src/                    # Project source code
+│   ├── __init__.py
+│   ├── data/               # Scripts for loading and processing data
+│   │   ├── __init__.py
+│   │   └── data_loader.py  
+│   ├── models/             # Model and kernel definitions
+│   │   ├── __init__.py
+│   │   ├── svgp.py         # Main model class
+│   │   └── kernels.py      # Your physics-informed kernels
+│   ├── training/           # Training logic and loops
+│   │   ├── __init__.py
+│   │   └── trainer.py
+│   └── utils/              # Helper functions, metrics (NLL, PICP)
+│       ├── __init__.py
+│       └── metrics.py
+├── .gitignore              
+├── requirements.txt        
+└── README.md               
 
 ## References
 * Saxena, A., Goebel, K., Simon, D., & Eklund, N. (2008). Damage Propagation Modeling for Aircraft Engine Run-to-Failure Simulation.
