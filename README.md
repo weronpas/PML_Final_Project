@@ -12,6 +12,7 @@ We are using the **NASA C-MAPSS** (Commercial Modular Aero-Propulsion System Sim
 * **Pandas, NumPy, Scikit-learn** (for data processing and evaluation)
 
 ## Repository Structure
+```text
 pml-digital-twin/
 ├── data/                   # Store data here
 │   ├── raw/                # Raw data downloaded directly from NASA
@@ -37,7 +38,7 @@ pml-digital-twin/
 ├── .gitignore              
 ├── requirements.txt        
 └── README.md               
-
+```
 ## References
 * Saxena, A., Goebel, K., Simon, D., & Eklund, N. (2008). Damage Propagation Modeling for Aircraft Engine Run-to-Failure Simulation.
 * Zhang, Z. J., et al. (2024). Probabilistic Learning from Real-World Observations of Systems with Unknown Inputs for Model-Form UQ and Digital Twinning.
