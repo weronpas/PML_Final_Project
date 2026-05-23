@@ -1,23 +1,22 @@
 import torch
 import gpytorch
 from gpytorch.models import ApproximateGP
-from gpytorch.variational import CholeskyVariationalDistribution
-from gpytorch.variational import VariationalStrategy
+from gpytorch.variational import CholeskyVariationalDistribution, VariationalStrategy
+from gpytorch.means import ConstantMean
+
+from src.models.kernels import DegradationKernel
 
 class RotatingMachinerySVGP(ApproximateGP):
     """
-    Sparse Variational Gaussian Process model for rotating machinery degradation.
+    Stochastic Variational Gaussian Process for RUL prediction.
+    Utilizes inducing points for scalability (O(M^3) instead of O(N^3)).
     """
-    def __init__(self, inducing_points: torch.Tensor, custom_kernel: gpytorch.kernels.Kernel):
-        """
-        Initializes the SVGP model.
-        
-        Args:
-            inducing_points (torch.Tensor): Initial locations for inducing points.
-            custom_kernel (gpytorch.kernels.Kernel): Physics-informed kernel.
-        """
-        # Define the variational distribution and strategy
+    def __init__(self, inducing_points: torch.Tensor, num_dimensions: int):
+        # Define the variational distribution q(u) using Cholesky for stability
         variational_distribution = CholeskyVariationalDistribution(inducing_points.size(0))
+        
+        # Strategy maps the inducing points to the full dataset
+        # learn_inducing_locations=True allows Adam to optimize their positions
         variational_strategy = VariationalStrategy(
             self, 
             inducing_points, 
@@ -26,13 +25,13 @@ class RotatingMachinerySVGP(ApproximateGP):
         )
         super().__init__(variational_strategy)
         
-        # Mean and Covariance (Kernel)
-        self.mean_module = gpytorch.means.ConstantMean()
-        self.covar_module = custom_kernel
+        # Core GP components
+        self.mean_module = ConstantMean()
+        self.covar_module = DegradationKernel(num_dimensions=num_dimensions)
 
-    def forward(self, x: torch.Tensor) -> gpytorch.distributions.MultivariateNormal:
+    def forward(self, x):
         """
-        Forward pass for the GP.
+        Computes the prior predictive distribution for the input x.
         """
         mean_x = self.mean_module(x)
         covar_x = self.covar_module(x)
