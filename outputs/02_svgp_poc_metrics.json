@@ -1,0 +1,42 @@
+{
+  "svgp": {
+    "train": {
+      "PHM08 Asymmetric Score (Lower is better)": 696.1224790942601,
+      "Fleet Correlation Metric (Higher is better)": 0.89328640100328,
+      "MAE (Mean Absolute Error)": 0.3623552686706316,
+      "RMSE (Root Mean Squared Error)": 0.4593600478625889,
+      "Perfect Predictions (d = 0)": 0,
+      "Early Predictions (d < 0, Safer)": 12002,
+      "Late Predictions (d > 0, Dangerous)": 8629
+    },
+    "test": {
+      "PHM08 Asymmetric Score (Lower is better)": 465.1689888649918,
+      "Fleet Correlation Metric (Higher is better)": 0.7503626101425767,
+      "MAE (Mean Absolute Error)": 0.3701132645454456,
+      "RMSE (Root Mean Squared Error)": 0.465000521193398,
+      "Perfect Predictions (d = 0)": 0,
+      "Early Predictions (d < 0, Safer)": 9344,
+      "Late Predictions (d > 0, Dangerous)": 3752
+    }
+  },
+  "dkl_autoencoder": {
+    "train": {
+      "PHM08 Asymmetric Score (Lower is better)": 750571.6072232022,
+      "Fleet Correlation Metric (Higher is better)": 0.8927225503777103,
+      "MAE (Mean Absolute Error)": 23.978699961164967,
+      "RMSE (Root Mean Squared Error)": 28.347937378018933,
+      "Perfect Predictions (d = 0)": 0,
+      "Early Predictions (d < 0, Safer)": 17255,
+      "Late Predictions (d > 0, Dangerous)": 3225
+    },
+    "test": {
+      "PHM08 Asymmetric Score (Lower is better)": 665138.3670187267,
+      "Fleet Correlation Metric (Higher is better)": 0.7619712772425193,
+      "MAE (Mean Absolute Error)": 29.1170506293845,
+      "RMSE (Root Mean Squared Error)": 31.964933976474263,
+      "Perfect Predictions (d = 0)": 0,
+      "Early Predictions (d < 0, Safer)": 11764,
+      "Late Predictions (d > 0, Dangerous)": 1332
+    }
+  }
+}
