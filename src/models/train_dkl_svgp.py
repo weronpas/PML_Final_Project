@@ -1,7 +1,7 @@
 import torch
 import torch.nn.functional as F
-from gpytorch.mlls import VariationalELBO
 from gpytorch.likelihoods import GaussianLikelihood
+from src.utils.metrics import negative_log_likelihood, evaluate_model_on_loader
 
 def train_dkl_autoencoder(train_loader, input_dim, latent_dim=4, num_inducing=100, epochs=10, lr=0.01, lambda_recon=0.5):
     from src.models.dkl_autoencoder_svgp import AutoencoderFeatureExtractor, DKLAutoencoderSVGP
@@ -33,8 +33,6 @@ def train_dkl_autoencoder(train_loader, input_dim, latent_dim=4, num_inducing=10
         {'params': likelihood.parameters()},                                    # Rumore
     ], lr=lr)
 
-    mll = VariationalELBO(likelihood, model, num_data=len(train_loader.dataset))
-
     print(f"--- Starting DKL Autoencoder SVGP Training ({epochs} Epochs) ---")
     for epoch in range(epochs):
         epoch_mll_loss = 0.0
@@ -49,7 +47,7 @@ def train_dkl_autoencoder(train_loader, input_dim, latent_dim=4, num_inducing=10
             
             # --- TASK 1: Regressione RUL (SVGP) ---
             output = model(x)
-            loss_mll = -mll(output, y.squeeze(-1)) # Minimizza Negative ELBO
+            loss_mll = negative_log_likelihood(output, y, likelihood=likelihood)
             
             # --- TASK 2: Ricostruzione (Autoencoder) ---
             x_reconstructed = model.feature_extractor.reconstruct(x)
@@ -66,5 +64,10 @@ def train_dkl_autoencoder(train_loader, input_dim, latent_dim=4, num_inducing=10
             epoch_recon_loss += loss_recon.item()
             
         print(f"Epoch {epoch+1:02d} | MLL Loss: {epoch_mll_loss/len(train_loader):.4f} | Recon Loss: {epoch_recon_loss/len(train_loader):.4f}")
+
+    final_report = evaluate_model_on_loader(model, train_loader, likelihood=likelihood)
+    print("DKL Autoencoder SVGP Training Evaluation Summary:")
+    for metric_name, metric_value in final_report.items():
+        print(f"  {metric_name}: {metric_value:.4f}" if isinstance(metric_value, (int, float)) else f"  {metric_name}: {metric_value}")
 
     return model, likelihood

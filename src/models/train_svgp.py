@@ -3,7 +3,6 @@ from pathlib import Path
 import torch
 import gpytorch
 from gpytorch.likelihoods import GaussianLikelihood
-from gpytorch.mlls import VariationalELBO
 from torch.utils.data import DataLoader
 
 project_root = Path(__file__).resolve().parents[2]
@@ -11,13 +10,15 @@ if str(project_root) not in sys.path:
     sys.path.append(str(project_root))
 
 from src.models.svgp import RotatingMachinerySVGP
+from src.utils.metrics import negative_log_likelihood, evaluate_model_on_loader
 
 def train_svgp(train_loader: DataLoader, num_features: int, num_inducing: int = 100, epochs: int = 10, lr: float = 0.01):
     """
-    Initializes and trains the SVGP model maximizing the Evidence Lower Bound (ELBO).
+    Initializes and trains the SVGP model using a probabilistic loss.
     """
     # Initialize inducing points using the first batch of training data
-    x_init_batch, _ = next(iter(train_loader))
+    first_batch = next(iter(train_loader))
+    x_init_batch = first_batch[0]
     inducing_points = x_init_batch[:num_inducing].clone()
     
     # Fallback if the first batch size is smaller than the requested inducing points
@@ -37,26 +38,32 @@ def train_svgp(train_loader: DataLoader, num_features: int, num_inducing: int = 
         {'params': likelihood.parameters()},
     ], lr=lr)
 
-    # Variational ELBO objective function scaling by total dataset size
-    mll = VariationalELBO(likelihood, model, num_data=len(train_loader.dataset))
-
     print(f"--- Starting SVGP Training ({epochs} Epochs) ---")
     for epoch in range(epochs):
         epoch_loss = 0.0
-        for x, y in train_loader:
+        for batch in train_loader:
+            if len(batch) == 3:
+                x, y, _ = batch
+            else:
+                x, y = batch
             optimizer.zero_grad()
             
             # Forward pass through the variational posterior q(f)
             output = model(x)
             
-            # Maximize ELBO by minimizing the Negative ELBO Loss
-            loss = -mll(output, y)
+            # Minimize the negative log-likelihood when the model returns a distribution
+            loss = negative_log_likelihood(output, y, likelihood=likelihood)
             loss.backward()
             optimizer.step()
             
             epoch_loss += loss.item()
             
-        print(f"Epoch {epoch+1:02d}/{epochs:02d} - Loss (Negative ELBO): {epoch_loss / len(train_loader):.4f}")
+        print(f"Epoch {epoch+1:02d}/{epochs:02d} - Loss (Negative Log Likelihood): {epoch_loss / len(train_loader):.4f}")
+
+    final_report = evaluate_model_on_loader(model, train_loader, likelihood=likelihood)
+    print("SVGP Training Evaluation Summary:")
+    for metric_name, metric_value in final_report.items():
+        print(f"  {metric_name}: {metric_value:.4f}" if isinstance(metric_value, (int, float)) else f"  {metric_name}: {metric_value}")
         
     print("-----------------------------------------\n")
     return model, likelihood
