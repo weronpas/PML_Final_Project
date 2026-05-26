@@ -28,7 +28,7 @@ pml-digital-twin/
 │   ├── models/             # Model and kernel definitions
 │   │   ├── __init__.py
 │   │   ├── svgp.py         # Main model class
-│   │   └── kernels.py      # Your physics-informed kernels
+│   │   └── kernels.py      # Physics-informed kernels
 │   ├── training/           # Training logic and loops
 │   │   ├── __init__.py
 │   │   └── trainer.py
