@@ -22,6 +22,8 @@ from src.utils.metrics import (
     gaussian_nll_from_mean_var,
     crps_gaussian,
     r2_score,
+    evaluate_model_on_loader,
+    evaluate_prognostics_model,
 )
 from src.data.data_loader import StreamingCMAPSSDataset, load_cmapss_data
 from src.models.svgp import RotatingMachinerySVGP
@@ -311,6 +313,31 @@ if __name__ == "__main__":
     dkl_model = train_results['model']
     dkl_likelihood = train_results['likelihood']
 
+    # --- Persist training evaluation metrics (full report + config) ---
+    try:
+        train_eval_dir = project_root / 'artifacts' / 'evaluation'
+        train_eval_dir.mkdir(parents=True, exist_ok=True)
+        train_metrics_path = train_eval_dir / 'dkl_fd001_train_metrics.json'
+
+        train_metrics = evaluate_model_on_loader(dkl_model, train_loader, likelihood=dkl_likelihood)
+        # Enrich with reproducibility / config metadata
+        train_metrics['seed'] = int(SEED)
+        train_metrics['train_config'] = {
+            'epochs': 70,
+            'lr': 0.0001,
+            'num_inducing': 256,
+            'lambda_recon': 0.5,
+            'input_dim': input_dim,
+            'latent_dim': latent_dim,
+            'max_rul_scale': float(MAX_RUL_SCALE)
+        }
+
+        with open(train_metrics_path, 'w') as fh:
+            json.dump(train_metrics, fh, indent=2)
+        print(f"Saved training metrics to: {train_metrics_path}")
+    except Exception as e:
+        print(f"Failed to persist training metrics: {e}")
+
     # Save trained model + likelihood + scaler for later evaluation
     ckpt_dir = project_root / 'artifacts' / 'checkpoints'
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -438,6 +465,25 @@ if __name__ == "__main__":
     try:
         if isinstance(eval_results, dict) and 'metrics' in eval_results:
             eval_results['metrics']['seed'] = int(SEED)
+            # Add prognostics-style report (PHM08, fleet correlation, counts, etc.)
+            # Build prognostics-style report from the already-scaled predictions
+            try:
+                preds = eval_results.get('predictions', {})
+                if preds and 'y_pred' in preds and 'y_true' in preds:
+                    prognostics_report = evaluate_prognostics_model(
+                        preds['y_pred'],
+                        preds['y_true'],
+                        predictive_vars=preds.get('y_var', None),
+                        lower_bounds=preds.get('lower_95', None),
+                        upper_bounds=preds.get('upper_95', None),
+                    )
+                else:
+                    prognostics_report = None
+            except Exception:
+                prognostics_report = None
+            if prognostics_report is not None:
+                eval_results['metrics']['prognostics_report'] = prognostics_report
+
             with open(metrics_path, 'w') as fh:
                 json.dump(eval_results['metrics'], fh, indent=2)
             with open(preds_path, 'w') as fh:
