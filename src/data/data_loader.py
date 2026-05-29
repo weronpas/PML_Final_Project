@@ -27,13 +27,10 @@ def load_cmapss_data(file_path: str, rul_file_path: Optional[str] = None, max_ru
         df = df.merge(true_rul, on='unit_nr')
         
 
-
-
         # RUL = final RUL + max cycle in test file - current cycle
         df['RUL'] = df['RUL_end'] + df['max_test_cycles'] - df['time_cycles']
         df = df.drop(columns=['max_test_cycles', 'RUL_end'])
         
-    # --- AGGIUNTA DEL CLIPPING DELLA RUL ---
     # Limita la RUL massima a max_rul (es. 125) per modellare il degrado piecewise-linear
     if max_rul is not None:
         df['RUL'] = df['RUL'].clip(upper=max_rul)
@@ -41,7 +38,7 @@ def load_cmapss_data(file_path: str, rul_file_path: Optional[str] = None, max_ru
     return df
 
 class StreamingCMAPSSDataset(Dataset):
-    def __init__(self, df: pd.DataFrame, features: List[str], scaler: Optional[StandardScaler] = None, fit_scaler: bool = False):
+    def __init__(self, df: pd.DataFrame, features: List[str], scaler: Optional[StandardScaler] = None, fit_scaler: bool = False, target_scale: float = 1.0):
         X_raw = df[features].values  
         self.unit_nrs = torch.tensor(df['unit_nr'].values, dtype=torch.int32) # Aggiungi questa riga
     
@@ -56,8 +53,13 @@ class StreamingCMAPSSDataset(Dataset):
 
             
         self.X = torch.tensor(X_scaled, dtype=torch.float32)
+        # Targets: optionally scale RUL by `target_scale` so training can use 0-1 targets.
+        # If target_scale == 1.0 this preserves raw RUL values (0..MAX_RUL).
+        y_vals = df['RUL'].values.astype(float)
+        if target_scale and float(target_scale) != 1.0:
+            y_vals = y_vals / float(target_scale)
         # Target must be shape (N, 1) for GPyTorch/PyTorch loss functions
-        self.y = torch.tensor(df['RUL'].values, dtype=torch.float32).unsqueeze(1)
+        self.y = torch.tensor(y_vals, dtype=torch.float32).unsqueeze(1)
         self.scaler = scaler
         
     def __len__(self) -> int:
