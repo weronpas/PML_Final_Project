@@ -5,11 +5,30 @@ from torch.utils.data import Dataset
 from sklearn.preprocessing import StandardScaler
 from typing import Tuple, List, Optional
 
-CMAPSS_COLUMNS = ['unit_nr', 'time_cycles', 'setting_1', 'setting_2', 'setting_3'] + \
-                 [f's_{i}' for i in range(1, 22)]
+
+BASE_CMAPSS_COLUMNS = ['unit_nr', 'time_cycles', 'setting_1', 'setting_2', 'setting_3']
+
+
+def infer_cmapss_columns(file_path: str) -> List[str]:
+    """Infer CMAPSS column names from a raw text file with whitespace-separated values."""
+    with open(file_path, 'r') as fh:
+        first_line = fh.readline().strip()
+
+    num_cols = len(first_line.split())
+    num_sensor_cols = max(0, num_cols - len(BASE_CMAPSS_COLUMNS))
+    return BASE_CMAPSS_COLUMNS + [f's_{i}' for i in range(1, num_sensor_cols + 1)]
+
+
+def get_sensor_feature_columns(df: pd.DataFrame) -> List[str]:
+    """Return sensor feature columns present in the dataframe, ordered by sensor index."""
+    sensor_cols = [c for c in df.columns if c.startswith('s_')]
+    sensor_cols.sort(key=lambda c: int(c.split('_')[1]) if c.split('_')[1].isdigit() else c)
+    return sensor_cols
 
 def load_cmapss_data(file_path: str, rul_file_path: Optional[str] = None, max_rul: Optional[int] = 125) -> pd.DataFrame:
-    df = pd.read_csv(file_path, sep=r'\s+', header=None, names=CMAPSS_COLUMNS)
+    # Infer columns so the same code works across FD001/FD002/FD003/FD004 variants.
+    col_names = infer_cmapss_columns(file_path)
+    df = pd.read_csv(file_path, sep=r'\s+', header=None, names=col_names)
     
     if rul_file_path is None:
         # Train set logic (run-to-failure): RUL = max_cycles - current_cycle

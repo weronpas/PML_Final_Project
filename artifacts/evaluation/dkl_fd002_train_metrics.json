@@ -1,0 +1,25 @@
+{
+  "PHM08 Asymmetric Score (Lower is better)": 1181.9443821559885,
+  "Fleet Correlation Metric (Higher is better)": 0.6439977852395509,
+  "R2 (Higher is better)": 0.17416234173523548,
+  "MAE (Mean Absolute Error)": 0.25455784012481014,
+  "RMSE (Root Mean Squared Error)": 0.302908145152123,
+  "Perfect Predictions (d = 0)": 0,
+  "Early Predictions (d < 0, Safer)": 28080,
+  "Late Predictions (d > 0, Dangerous)": 25679,
+  "picp_95": 0.856470544466973,
+  "avg_interval_width_95": 0.8079983369498588,
+  "avg_pred_variance": 0.04647089777892245,
+  "subset": "FD002",
+  "seed": 43,
+  "train_config": {
+    "epochs": 70,
+    "lr": 0.0001,
+    "num_inducing": 256,
+    "lambda_recon": 0.5,
+    "input_dim": 21,
+    "latent_dim": 4,
+    "num_sensors": 21,
+    "max_rul_scale": 125.0
+  }
+}

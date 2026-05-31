@@ -8,6 +8,7 @@
   "avg_interval_width_95": 77.23251914555661,
   "avg_pred_variance": 403.1388172203255,
   "num_samples": 13096,
+  "subset": "FD001",
   "seed": 42,
   "prognostics_report": {
     "PHM08 Asymmetric Score (Lower is better)": 115036.86917933622,

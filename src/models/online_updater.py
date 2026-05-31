@@ -9,6 +9,7 @@ from torch.utils.data import DataLoader
 import joblib
 import json
 import random
+import csv
 
 # Resolve project root pathing
 project_root = Path(__file__).resolve().parents[2]
@@ -25,7 +26,7 @@ from src.utils.metrics import (
     evaluate_model_on_loader,
     evaluate_prognostics_model,
 )
-from src.data.data_loader import StreamingCMAPSSDataset, load_cmapss_data
+from src.data.data_loader import StreamingCMAPSSDataset, load_cmapss_data, get_sensor_feature_columns
 from src.models.svgp import RotatingMachinerySVGP
 from src.models.dkl_autoencoder_svgp import DKLAutoencoderSVGP
 
@@ -252,76 +253,144 @@ if __name__ == "__main__":
     from sklearn.preprocessing import StandardScaler
     from src.models.dkl_autoencoder_svgp import AutoencoderFeatureExtractor
     from src.models.train_dkl_svgp import train_dkl_autoencoder
-    
-    print("Verifying pipeline safety mechanics for DKL compatibility...")
+
+    print("Verifying pipeline safety mechanics for DKL compatibility across FD001/FD002/FD003/FD004...")
 
     SEED = 42
-    set_reproducible_seed(SEED)
-    
-    # Load the real FD001 training stream from the repository data folder.
-    features = [f's_{i}' for i in range(1, 22)]
-    train_path = str(project_root / 'data' / 'raw' / 'train_FD001.txt')
-    df_fd001 = load_cmapss_data(train_path)
-    df_fd001 = df_fd001.sort_values(['unit_nr', 'time_cycles']).reset_index(drop=True)
-
-    input_dim = len(features)
-    latent_dim = 4
-
-    # Use consistent RUL clipping/scale for CMAPSS
+    FD_SUBSETS = ['FD001', 'FD002', 'FD003', 'FD004']
     MAX_RUL_SCALE = 125.0
-    df_fd001['RUL'] = df_fd001['RUL'].clip(upper=MAX_RUL_SCALE)
 
-    scaler = StandardScaler()
-    # Training dataset: scale RUL targets to [0,1] by dividing by MAX_RUL_SCALE
-    fd001_dataset = StreamingCMAPSSDataset(
-        df=df_fd001,
-        features=features,
-        scaler=scaler,
-        fit_scaler=True,
-        target_scale=MAX_RUL_SCALE
-    )
-    fd001_stream_loader = DataLoader(fd001_dataset, batch_size=1, shuffle=False)
-    # Train the full DKL-SVGP pipeline using the dedicated trainer instead of manual pretraining.
-    train_loader = DataLoader(fd001_dataset, batch_size=256, shuffle=True)
-    
-    
-    dkl_model, dkl_likelihood = train_dkl_autoencoder(
-        train_loader=train_loader,
-        input_dim=input_dim,
-        latent_dim=latent_dim,
-        num_inducing=256,
-        epochs=70,
-        lr=0.0001,
-        lambda_recon=0.5,
-        seed=SEED,
-    )
-    
-    # Execute full operational pipeline safety check 
-    train_results = simulate_online_stream_and_update(
-        model=dkl_model,
-        likelihood=dkl_likelihood,
-        stream_loader=fd001_stream_loader,
-        update_every_x_cycles=10,
-        fine_tune_epochs=1,
-        lr=0.002,
-        lambda_recon=0.5,
-        weight_decay=1e-4,
-        tune_feature_extractor=False,
-        grad_clip_norm=1.0,
-        rul_scale_factor=1.0 
-    )
-    dkl_model = train_results['model']
-    dkl_likelihood = train_results['likelihood']
+    def persist_aggregate_summary(run_summaries: list) -> None:
+        eval_dir = project_root / 'artifacts' / 'evaluation'
+        eval_dir.mkdir(parents=True, exist_ok=True)
 
-    # --- Persist training evaluation metrics (full report + config) ---
-    try:
+        summary_json_path = eval_dir / 'dkl_all_subsets_summary.json'
+        summary_csv_path = eval_dir / 'dkl_all_subsets_summary.csv'
+
+        rows = []
+        for summary in run_summaries:
+            row = {
+                'subset': summary.get('subset'),
+                'num_sensors': summary.get('num_sensors'),
+            }
+            metrics_path = summary.get('test_metrics_path')
+            if metrics_path and Path(metrics_path).exists():
+                try:
+                    with open(metrics_path, 'r') as fh:
+                        metrics = json.load(fh)
+                    for key in [
+                        'rmse',
+                        'mae',
+                        'nll',
+                        'crps',
+                        'r2',
+                        'picp_95',
+                        'avg_interval_width_95',
+                        'avg_pred_variance',
+                        'num_samples',
+                    ]:
+                        if key in metrics:
+                            row[key] = metrics[key]
+                except Exception:
+                    row['metrics_read_error'] = True
+            else:
+                row['metrics_read_error'] = True
+            rows.append(row)
+
+        with open(summary_json_path, 'w') as fh:
+            json.dump(rows, fh, indent=2)
+
+        fieldnames = [
+            'subset',
+            'num_sensors',
+            'rmse',
+            'mae',
+            'nll',
+            'crps',
+            'r2',
+            'picp_95',
+            'avg_interval_width_95',
+            'avg_pred_variance',
+            'num_samples',
+            'metrics_read_error',
+        ]
+        with open(summary_csv_path, 'w', newline='') as fh:
+            writer = csv.DictWriter(fh, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow(row)
+
+        print(f"Saved aggregate summary JSON to: {summary_json_path}")
+        print(f"Saved aggregate summary CSV to: {summary_csv_path}")
+
+    def run_fd_subset_pipeline(fd_subset: str, seed: int) -> dict:
+        set_reproducible_seed(seed)
+        print(f"\n===================== {fd_subset}: PIPELINE START =====================")
+
+        train_path = str(project_root / 'data' / 'raw' / f'train_{fd_subset}.txt')
+        test_path = str(project_root / 'data' / 'raw' / f'test_{fd_subset}.txt')
+        rul_path = str(project_root / 'data' / 'raw' / f'RUL_{fd_subset}.txt')
+
+        df_train = load_cmapss_data(train_path)
+        df_train = df_train.sort_values(['unit_nr', 'time_cycles']).reset_index(drop=True)
+
+        features = get_sensor_feature_columns(df_train)
+        if not features:
+            raise ValueError(f"No sensor columns found for {fd_subset}")
+
+        input_dim = len(features)
+        latent_dim = 4
+
+        # Use consistent RUL clipping/scale across all CMAPSS subsets.
+        df_train['RUL'] = df_train['RUL'].clip(upper=MAX_RUL_SCALE)
+
+        scaler = StandardScaler()
+        train_dataset = StreamingCMAPSSDataset(
+            df=df_train,
+            features=features,
+            scaler=scaler,
+            fit_scaler=True,
+            target_scale=MAX_RUL_SCALE,
+        )
+        train_stream_loader = DataLoader(train_dataset, batch_size=1, shuffle=False)
+        train_loader = DataLoader(train_dataset, batch_size=256, shuffle=True)
+
+        dkl_model, dkl_likelihood = train_dkl_autoencoder(
+            train_loader=train_loader,
+            input_dim=input_dim,
+            latent_dim=latent_dim,
+            num_inducing=256,
+            epochs=70,
+            lr=0.0001,
+            lambda_recon=0.5,
+            seed=seed,
+        )
+
+        # Streaming-style adaptation on training stream.
+        train_results = simulate_online_stream_and_update(
+            model=dkl_model,
+            likelihood=dkl_likelihood,
+            stream_loader=train_stream_loader,
+            update_every_x_cycles=10,
+            fine_tune_epochs=1,
+            lr=0.002,
+            lambda_recon=0.5,
+            weight_decay=1e-4,
+            tune_feature_extractor=False,
+            grad_clip_norm=1.0,
+            rul_scale_factor=1.0,
+        )
+        dkl_model = train_results['model']
+        dkl_likelihood = train_results['likelihood']
+
+        # Persist train metrics.
         train_eval_dir = project_root / 'artifacts' / 'evaluation'
         train_eval_dir.mkdir(parents=True, exist_ok=True)
-        train_metrics_path = train_eval_dir / 'dkl_fd001_train_metrics.json'
+        train_metrics_path = train_eval_dir / f'dkl_{fd_subset.lower()}_train_metrics.json'
 
         train_metrics = evaluate_model_on_loader(dkl_model, train_loader, likelihood=dkl_likelihood)
-        # Enrich with reproducibility / config metadata
-        train_metrics['seed'] = int(SEED)
+        train_metrics['subset'] = fd_subset
+        train_metrics['seed'] = int(seed)
         train_metrics['train_config'] = {
             'epochs': 70,
             'lr': 0.0001,
@@ -329,144 +398,105 @@ if __name__ == "__main__":
             'lambda_recon': 0.5,
             'input_dim': input_dim,
             'latent_dim': latent_dim,
-            'max_rul_scale': float(MAX_RUL_SCALE)
+            'num_sensors': len(features),
+            'max_rul_scale': float(MAX_RUL_SCALE),
         }
-
         with open(train_metrics_path, 'w') as fh:
             json.dump(train_metrics, fh, indent=2)
         print(f"Saved training metrics to: {train_metrics_path}")
-    except Exception as e:
-        print(f"Failed to persist training metrics: {e}")
 
-    # Save trained model + likelihood + scaler for later evaluation
-    ckpt_dir = project_root / 'artifacts' / 'checkpoints'
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-    ckpt_path = ckpt_dir / 'dkl_fd001_checkpoint.pth'
-    scaler_path = ckpt_dir / 'scaler_fd001.pkl'
+        # Save trained model + likelihood + scaler for subset-specific evaluation.
+        ckpt_dir = project_root / 'artifacts' / 'checkpoints'
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        ckpt_path = ckpt_dir / f'dkl_{fd_subset.lower()}_checkpoint.pth'
+        scaler_path = ckpt_dir / f'scaler_{fd_subset.lower()}.pkl'
 
-    try:
-        torch.save({
-            'model_state_dict': dkl_model.state_dict(),
-            'likelihood_state_dict': dkl_likelihood.state_dict()
-        }, str(ckpt_path))
+        import time
+        torch.save(
+            {
+                'model_state_dict': dkl_model.state_dict(),
+                'likelihood_state_dict': dkl_likelihood.state_dict(),
+                'meta': {
+                    'saved_at': time.time(),
+                    'subset': fd_subset,
+                    'seed': int(seed),
+                    'max_rul_scale': float(MAX_RUL_SCALE),
+                    'num_inducing': int(dkl_model.variational_strategy.inducing_points.size(0)),
+                    'input_dim': int(input_dim),
+                    'latent_dim': int(latent_dim),
+                    'features': list(features),
+                },
+            },
+            str(ckpt_path),
+        )
         joblib.dump(scaler, str(scaler_path))
         print(f"Saved checkpoint to: {ckpt_path}")
-    except Exception as e:
-        print(f"Warning: failed to save checkpoint/scaler: {e}")
-    # Overwrite with richer metadata for reproducibility
-    try:
-        import time
-        torch.save({
-            'model_state_dict': dkl_model.state_dict(),
-            'likelihood_state_dict': dkl_likelihood.state_dict(),
-            'meta': {
-                'saved_at': time.time(),
-                'seed': int(SEED),
-                'max_rul_scale': float(MAX_RUL_SCALE),
-                'num_inducing': int(dkl_model.variational_strategy.inducing_points.size(0))
-            }
-        }, str(ckpt_path))
-    except Exception as e:
-        print(f"Warning: failed to save enriched checkpoint: {e}")
 
-    # --- Run the simulator over the FD001 TEST split with true RUL labels ---
-    print("\nRunning FD001 TEST stream (with RUL labels) for evaluation only...")
-    test_path = str(project_root / 'data' / 'raw' / 'test_FD001.txt')
-    rul_path = str(project_root / 'data' / 'raw' / 'RUL_FD001.txt')
-    df_fd001_test = load_cmapss_data(test_path, rul_path)
-    df_fd001_test = df_fd001_test.sort_values(['unit_nr', 'time_cycles']).reset_index(drop=True)
+        # --- Run TEST stream (with true RUL labels) for evaluation only ---
+        print(f"\nRunning {fd_subset} TEST stream (with RUL labels) for evaluation only...")
+        df_test = load_cmapss_data(test_path, rul_path)
+        df_test = df_test.sort_values(['unit_nr', 'time_cycles']).reset_index(drop=True)
+        df_test['RUL'] = df_test['RUL'].clip(upper=MAX_RUL_SCALE)
 
-    df_fd001_test['RUL'] = df_fd001_test['RUL'].clip(upper=MAX_RUL_SCALE)
+        scaler_test = joblib.load(str(scaler_path))
+        test_dataset = StreamingCMAPSSDataset(
+            df=df_test,
+            features=features,
+            scaler=scaler_test,
+            fit_scaler=False,
+            target_scale=1.0,
+        )
+        test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
 
-    if scaler_path.exists():
+        dkl_model_test = None
+        dkl_likelihood_test = gpytorch.likelihoods.GaussianLikelihood()
         try:
-            scaler_test = joblib.load(str(scaler_path))
-            fit_scaler_test = False
-            print(f"Loaded scaler from {scaler_path}")
+            with torch.no_grad():
+                dkl_likelihood_test.noise = torch.tensor(0.01)
         except Exception:
-            scaler_test = StandardScaler()
-            fit_scaler_test = True
-    else:
-        scaler_test = StandardScaler()
-        fit_scaler_test = True
+            pass
 
-    # Test dataset: keep raw RUL values in [0, MAX_RUL_SCALE] for metric calculation
-    fd001_test_dataset = StreamingCMAPSSDataset(
-        df=df_fd001_test,
-        features=features,
-        scaler=scaler_test,
-        fit_scaler=fit_scaler_test,
-        target_scale=1.0
-    )
-    fd001_test_loader = DataLoader(fd001_test_dataset, batch_size=1, shuffle=False)
-
-    dkl_model_test = None
-    dkl_likelihood_test = gpytorch.likelihoods.GaussianLikelihood()
-    try:
-        with torch.no_grad():
-            # Use a modest initial noise (on normalized scale) if checkpoint loading fails.
-            dkl_likelihood_test.noise = torch.tensor(0.01)
-    except Exception:
-        pass
-
-    if ckpt_path.exists():
-        try:
+        if ckpt_path.exists():
             ckpt = torch.load(str(ckpt_path), map_location='cpu')
-            fe_test = AutoencoderFeatureExtractor(input_dim=input_dim, latent_dim=latent_dim)
-            # Rebuild model with the same inducing-point count used during training.
-            if isinstance(ckpt, dict) and 'meta' in ckpt and isinstance(ckpt['meta'], dict) and 'num_inducing' in ckpt['meta']:
-                num_inducing_test = int(ckpt['meta']['num_inducing'])
-            else:
-                inducing_from_state = ckpt.get('model_state_dict', {}).get('variational_strategy.inducing_points', None)
-                num_inducing_test = int(inducing_from_state.size(0)) if inducing_from_state is not None else 256
+            ckpt_meta = ckpt.get('meta', {}) if isinstance(ckpt, dict) else {}
+            num_inducing_test = int(ckpt_meta.get('num_inducing', 256))
+            input_dim_test = int(ckpt_meta.get('input_dim', input_dim))
+            latent_dim_test = int(ckpt_meta.get('latent_dim', latent_dim))
 
-            inducing_pts_latent_test = torch.randn(num_inducing_test, input_dim)
+            fe_test = AutoencoderFeatureExtractor(input_dim=input_dim_test, latent_dim=latent_dim_test)
+            inducing_pts_input_test = torch.randn(num_inducing_test, input_dim_test)
             dkl_model_test = DKLAutoencoderSVGP(
                 feature_extractor=fe_test,
-                inducing_points=inducing_pts_latent_test,
-                latent_dim=latent_dim
+                inducing_points=inducing_pts_input_test,
+                latent_dim=latent_dim_test,
             )
             dkl_model_test.load_state_dict(ckpt['model_state_dict'], strict=True)
             dkl_likelihood_test.load_state_dict(ckpt['likelihood_state_dict'], strict=True)
             print(f"Loaded trained model + likelihood from {ckpt_path}")
-        except Exception as e:
-            print(f"Failed to load checkpoint, falling back to fresh model: {e}")
 
-    if dkl_model_test is None:
-        fe_test = AutoencoderFeatureExtractor(input_dim=input_dim, latent_dim=latent_dim)
-        inducing_pts_latent_test = torch.randn(256, input_dim)
-        dkl_model_test = DKLAutoencoderSVGP(
-            feature_extractor=fe_test,
-            inducing_points=inducing_pts_latent_test,
-            latent_dim=latent_dim
+        if dkl_model_test is None:
+            raise RuntimeError(f"Unable to initialize evaluation model for {fd_subset}")
+
+        eval_results = simulate_online_stream_and_update(
+            model=dkl_model_test,
+            likelihood=dkl_likelihood_test,
+            stream_loader=test_loader,
+            update_every_x_cycles=10,
+            fine_tune_epochs=0,
+            lr=0.001,
+            lambda_recon=0.0,
+            collect_metrics=True,
+            rul_scale_factor=MAX_RUL_SCALE,
         )
 
-    # Evaluation only: no fine-tuning. Collect metrics and persist them.
-    # Evaluation: simulator will remultiply model's normalized predictions by `MAX_RUL_SCALE`
-    eval_results = simulate_online_stream_and_update(
-        model=dkl_model_test,
-        likelihood=dkl_likelihood_test,
-        stream_loader=fd001_test_loader,
-        update_every_x_cycles=10,
-        fine_tune_epochs=0, 
-        lr=0.001,
-        lambda_recon=0.0,
-        collect_metrics=True,
-        rul_scale_factor=MAX_RUL_SCALE 
-    )
+        eval_dir = project_root / 'artifacts' / 'evaluation'
+        eval_dir.mkdir(parents=True, exist_ok=True)
+        metrics_path = eval_dir / f'dkl_{fd_subset.lower()}_test_metrics.json'
+        preds_path = eval_dir / f'dkl_{fd_subset.lower()}_test_predictions.json'
 
-    # Persist evaluation metrics and predictions
-    eval_dir = project_root / 'artifacts' / 'evaluation'
-    eval_dir.mkdir(parents=True, exist_ok=True)
-
-    metrics_path = eval_dir / 'dkl_fd001_test_metrics.json'
-    preds_path = eval_dir / 'dkl_fd001_test_predictions.json'
-
-    try:
         if isinstance(eval_results, dict) and 'metrics' in eval_results:
-            eval_results['metrics']['seed'] = int(SEED)
-            # Add prognostics-style report (PHM08, fleet correlation, counts, etc.)
-            # Build prognostics-style report from the already-scaled predictions
+            eval_results['metrics']['subset'] = fd_subset
+            eval_results['metrics']['seed'] = int(seed)
             try:
                 preds = eval_results.get('predictions', {})
                 if preds and 'y_pred' in preds and 'y_true' in preds:
@@ -481,6 +511,7 @@ if __name__ == "__main__":
                     prognostics_report = None
             except Exception:
                 prognostics_report = None
+
             if prognostics_report is not None:
                 eval_results['metrics']['prognostics_report'] = prognostics_report
 
@@ -488,9 +519,34 @@ if __name__ == "__main__":
                 json.dump(eval_results['metrics'], fh, indent=2)
             with open(preds_path, 'w') as fh:
                 json.dump(eval_results['predictions'], fh)
+
             print(f"Saved evaluation metrics to: {metrics_path}")
             print(f"Saved evaluation predictions to: {preds_path}")
         else:
-            print("No metrics were returned from evaluation.")
-    except Exception as e:
-        print(f"Failed to persist evaluation artifacts: {e}")
+            print(f"No metrics were returned from evaluation for {fd_subset}.")
+
+        return {
+            'subset': fd_subset,
+            'num_sensors': len(features),
+            'train_metrics_path': str(train_metrics_path),
+            'test_metrics_path': str(metrics_path),
+            'test_predictions_path': str(preds_path),
+        }
+
+    run_summaries = []
+    for i, fd_subset in enumerate(FD_SUBSETS):
+        try:
+            summary = run_fd_subset_pipeline(fd_subset=fd_subset, seed=SEED + i)
+            run_summaries.append(summary)
+        except Exception as e:
+            print(f"[{fd_subset}] Pipeline failed: {e}")
+
+    print("\n===================== ALL SUBSETS SUMMARY =====================")
+    for summary in run_summaries:
+        print(
+            f"{summary['subset']}: sensors={summary['num_sensors']} | "
+            f"test_metrics={summary['test_metrics_path']} | "
+            f"test_predictions={summary['test_predictions_path']}"
+        )
+
+    persist_aggregate_summary(run_summaries)
