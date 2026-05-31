@@ -10,6 +10,7 @@
   "picp_95": 0.9791091076535311,
   "avg_interval_width_95": 0.691059157872742,
   "avg_pred_variance": 0.03392135767134069,
+  "subset": "FD001",
   "seed": 42,
   "train_config": {
     "epochs": 70,
@@ -18,6 +19,7 @@
     "lambda_recon": 0.5,
     "input_dim": 21,
     "latent_dim": 4,
+    "num_sensors": 21,
     "max_rul_scale": 125.0
   }
 }

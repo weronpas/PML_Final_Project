@@ -1,0 +1,26 @@
+{
+  "rmse": 32.77653790367327,
+  "mae": 31.040308617039145,
+  "nll": 4.904730804667459,
+  "crps": 19.405129980561483,
+  "r2": -0.656817107435862,
+  "picp_95": 0.9951230164507207,
+  "avg_interval_width_95": 131.94585014915643,
+  "avg_pred_variance": 1142.7377132545907,
+  "num_samples": 41214,
+  "subset": "FD004",
+  "seed": 45,
+  "prognostics_report": {
+    "PHM08 Asymmetric Score (Lower is better)": 1136581.5707885707,
+    "Fleet Correlation Metric (Higher is better)": 0.37421577274761136,
+    "R2 (Higher is better)": -0.656817107435862,
+    "MAE (Mean Absolute Error)": 31.040308617039145,
+    "RMSE (Root Mean Squared Error)": 32.77653790367327,
+    "Perfect Predictions (d = 0)": 0,
+    "Early Predictions (d < 0, Safer)": 35017,
+    "Late Predictions (d > 0, Dangerous)": 6197,
+    "picp_95": 0.9951230164507207,
+    "avg_interval_width_95": 131.94585014915643,
+    "avg_pred_variance": 1142.7377132545907
+  }
+}
