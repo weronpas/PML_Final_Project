@@ -107,12 +107,18 @@ def train_dkl_autoencoder(
 
     # 3. Setup del Modello e Likelihood
     model = DKLAutoencoderSVGP(feature_extractor, inducing_points, latent_dim)
-    likelihood = GaussianLikelihood()
+    # FIX: Gabbia Matematica per l'Incertezza (Varianza)
+    # Impediamo all'ottimizzatore di far esplodere il rumore verso l'infinito.
+    # Obblighiamo il modello a calibrare l'incertezza vera basandosi sui dati.
+    noise_constraint = gpytorch.constraints.Interval(1e-4, 2.0)
+    likelihood = GaussianLikelihood(noise_constraint=noise_constraint)
+    
     # Initialize observation noise variance to a reasonable value; allow learning if enabled.
     try:
         likelihood.noise = torch.tensor(float(init_likelihood_noise))
     except Exception:
         pass
+    
     # Optionally allow the observation noise to be learned
     if not learn_likelihood_noise:
         for p in likelihood.parameters():
