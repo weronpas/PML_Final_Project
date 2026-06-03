@@ -54,6 +54,7 @@ def train_dkl_autoencoder(
     learn_likelihood_noise=True,
     init_likelihood_noise=0.01,
     label_noise_std=0.0,
+    beta_kl=0.1,  
     seed: int | None = None,
 ):
     from src.models.dkl_autoencoder_svgp import AutoencoderFeatureExtractor, DKLAutoencoderSVGP
@@ -144,8 +145,13 @@ def train_dkl_autoencoder(
         {'params': likelihood.parameters(), 'lr': gp_lr * 0.1},
     ])
 
-    mll = gpytorch.mlls.VariationalELBO(likelihood, model.gp_layer, num_data=len(train_loader.dataset))
-
+    mll = gpytorch.mlls.VariationalELBO(
+        likelihood,
+        model.gp_layer,
+        num_data=len(train_loader.dataset),
+        beta=beta_kl,           # ← beta < 1 riduce il peso del KL, allarga la varianza posteriore
+    )
+    
     print(f"--- Starting DKL Autoencoder SVGP Training ({epochs} Epochs) ---")
     for epoch in range(epochs):
         epoch_mll_loss = 0.0
