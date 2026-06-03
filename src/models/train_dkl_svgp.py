@@ -26,12 +26,16 @@ def _collect_latent_embeddings(feature_extractor, train_loader, device):
     with torch.no_grad():
         for batch in train_loader:
             x = batch[0].to(device)
-            latents.append(feature_extractor.encoder(x).detach().cpu())
+            # FIXED: Catch time element
+            t = batch[3].to(device) if len(batch) == 4 else None
+            
+            # FIXED: Pass normalized_cycle
+            latents.append(feature_extractor.encoder(x, normalized_cycle=t).detach().cpu())
+            
     feature_extractor.train()
     if not latents:
         raise ValueError('Unable to collect latent embeddings from an empty training loader.')
     return torch.cat(latents, dim=0)
-
 
 def train_dkl_autoencoder(
     train_loader,
@@ -44,7 +48,9 @@ def train_dkl_autoencoder(
     decoder_lr=None,
     gp_lr=None,
     weight_decay=1e-5,
-    lambda_recon=0.1,
+    lambda_recon=1.0,       # raised from 0.1 — forces a structured latent space
+    lambda_asymm=0.5,       # weight for PHM asymmetric penalty (late preds cost more)
+    asymm_late_penalty=1.5, # multiplier applied to late prediction errors (ŷ > y)
     learn_likelihood_noise=True,
     init_likelihood_noise=0.01,
     label_noise_std=0.0,
@@ -57,9 +63,38 @@ def train_dkl_autoencoder(
 
     # 1. Inizializza il feature extractor (Autoencoder)
     feature_extractor = AutoencoderFeatureExtractor(input_dim=input_dim, latent_dim=latent_dim)
-    
-    # 2. Initialize inducing points in the latent space using K-Means centroids.
+
+    # 1b. Warm-up: pre-train the autoencoder on reconstruction only so that
+    #     the encoder produces a meaningful latent space before we run K-Means
+    #     for inducing point initialization.  Without this the inducing points
+    #     are seeded from a random projection and the GP never recovers.
     device = next(feature_extractor.parameters()).device
+    _warmup_epochs = 10
+    _warmup_lr = 5e-4
+    _warmup_optimizer = torch.optim.Adam(
+        feature_extractor.parameters(), lr=_warmup_lr, weight_decay=weight_decay
+    )
+    print(f"--- Encoder Warm-up ({_warmup_epochs} epochs, reconstruction only) ---")
+    feature_extractor.train()
+    for _ep in range(_warmup_epochs):
+        _ep_loss = 0.0
+        for batch in train_loader:
+            x_w = batch[0].to(device)
+            # FIXED: Catch time element
+            t_w = batch[3].to(device) if len(batch) == 4 else None
+            
+            _warmup_optimizer.zero_grad()
+            # FIXED: Pass normalized_cycle to reconstruct()
+            _loss = F.mse_loss(feature_extractor.reconstruct(x_w, normalized_cycle=t_w), x_w)
+            
+            _loss.backward()
+            _warmup_optimizer.step()
+            _ep_loss += _loss.item()
+        print(f"  Warm-up epoch {_ep+1:02d} | Recon Loss: {_ep_loss/len(train_loader):.4f}")
+
+
+    # 2. Initialize inducing points in the latent space using K-Means centroids.
+    #    Now collected from a trained encoder → meaningful clusters.
     latent_embeddings = _collect_latent_embeddings(feature_extractor, train_loader, device=device)
     latent_np = latent_embeddings.numpy()
     n_clusters = min(int(num_inducing), int(latent_np.shape[0]))
@@ -87,12 +122,14 @@ def train_dkl_autoencoder(
     likelihood.train()
 
     # 4. Split optimization between representation learning and GP fitting.
+    #    Default LR ratio is kept at ~10x (not 100x as before) so the encoder
+    #    gradient is not drowned out by fast-moving GP hyperparameters.
     if encoder_lr is None:
-        encoder_lr = 1e-4
+        encoder_lr = 5e-4
     if decoder_lr is None:
-        decoder_lr = 1e-4
+        decoder_lr = 5e-4
     if gp_lr is None:
-        gp_lr = 1e-2
+        gp_lr = 5e-3
 
     optimizer = torch.optim.Adam([
         {'params': feature_extractor.encoder.parameters(), 'lr': encoder_lr, 'weight_decay': weight_decay},
@@ -107,34 +144,71 @@ def train_dkl_autoencoder(
     for epoch in range(epochs):
         epoch_mll_loss = 0.0
         epoch_recon_loss = 0.0
+        epoch_asymm_loss = 0.0
         
         for batch in train_loader:
-            if len(batch) == 3:
+            # FIXED: Unpack 4-tuple safely
+            if len(batch) == 4:
+                x, y, _, t = batch
+            elif len(batch) == 3:
                 x, y, _ = batch
+                t = None
             else:
                 x, y = batch
+                t = None
 
             # Add small Gaussian label noise only when explicitly requested.
             if label_noise_std and label_noise_std > 0.0:
                 y_noisy = y + (torch.randn_like(y) * float(label_noise_std))
             else:
                 y_noisy = y
+                
+            x = x.to(device)
+            y_noisy = y_noisy.to(device)
+            if t is not None:
+                t = t.to(device)
+                
             optimizer.zero_grad()
 
             with gpytorch.settings.cholesky_jitter(1e-4):
-                output = model(x)
+                # FIXED: Pass normalized_cycle to forward()
+                output = model(x, normalized_cycle=t)
                 variational_elbo = mll(output, y_noisy.squeeze(-1))
-                x_reconstructed = feature_extractor.reconstruct(x)
+                
+                # FIXED: Pass normalized_cycle to reconstruct()
+                x_reconstructed = feature_extractor.reconstruct(x, normalized_cycle=t)
                 loss_recon = F.mse_loss(x_reconstructed, x)
-                total_loss = (-1.0 * variational_elbo) + (lambda_recon * loss_recon)
+                
+
+                # PHM asymmetric penalty: late predictions (mean > true RUL)
+                # are penalized more heavily than early ones, aligning training
+                # with the C-MAPSS evaluation metric.
+                pred_errors = output.mean - y_noisy.squeeze(-1)
+                asym_weights = torch.where(
+                    pred_errors > 0,
+                    torch.full_like(pred_errors, float(asymm_late_penalty)),
+                    torch.ones_like(pred_errors),
+                )
+                loss_asymm = (asym_weights * pred_errors.pow(2)).mean()
+
+                total_loss = (
+                    (-1.0 * variational_elbo)
+                    + (lambda_recon * loss_recon)
+                    + (lambda_asymm * loss_asymm)
+                )
 
             total_loss.backward()
             optimizer.step()
             
             epoch_mll_loss += float((-1.0 * variational_elbo).item())
             epoch_recon_loss += loss_recon.item()
+            epoch_asymm_loss += loss_asymm.item()
             
-        print(f"Epoch {epoch+1:02d} | ELBO Loss: {epoch_mll_loss/len(train_loader):.4f} | Recon Loss: {epoch_recon_loss/len(train_loader):.4f}")
+        print(
+            f"Epoch {epoch+1:02d} | ELBO Loss: {epoch_mll_loss/len(train_loader):.4f}"
+            f" | Recon Loss: {epoch_recon_loss/len(train_loader):.4f}"
+            f" | Asymm Loss: {epoch_asymm_loss/len(train_loader):.4f}"
+        )
 
     final_report = evaluate_model_on_loader(model, train_loader, likelihood=likelihood)
     print("DKL Autoencoder SVGP Training Evaluation Summary:")

@@ -53,18 +53,27 @@ def evaluate_model_on_loader(model, data_loader, likelihood=None, device=None):
 
     with torch.no_grad():
         for batch in data_loader:
-            if len(batch) == 3:
+            if len(batch) == 4:
+                x, y, _, t = batch
+            elif len(batch) == 3:
                 x, y, _ = batch
+                t = None
             else:
                 x, y = batch
+                t = None
 
             x = x.to(device)
             y = y.to(device)
 
             if hasattr(model, 'predict_with_uncertainty'):
-                prediction = model.predict_with_uncertainty(x, likelihood=likelihood)
+                # FIXED: Pass the normalized time context here
+                prediction = model.predict_with_uncertainty(x, normalized_cycle=t, likelihood=likelihood)
             else:
-                prediction = model(x)
+                # FIXED: Fallback branch also attempts to pass time if supported
+                try:
+                    prediction = model(x, normalized_cycle=t)
+                except TypeError:
+                    prediction = model(x)
 
             if isinstance(prediction, dict):
                 batch_estimated_rul = prediction.get('mean')

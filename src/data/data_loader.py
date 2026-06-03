@@ -6,6 +6,7 @@ from torch.utils.data import Dataset
 from sklearn.preprocessing import StandardScaler
 from dataclasses import dataclass, field
 from typing import Tuple, List, Optional, Union
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
 
 
 BASE_CMAPSS_COLUMNS = ['unit_nr', 'time_cycles', 'setting_1', 'setting_2', 'setting_3']
@@ -168,6 +169,8 @@ class StreamingCMAPSSDataset(Dataset):
         features: List[str],
         scaler: Optional[StandardScaler] = None,
         fit_scaler: bool = False,
+        time_scaler: Optional[MinMaxScaler] = None,
+        fit_time_scaler: bool = False,
         target_transform: Optional[SmoothRULTargetTransform] = None,
         fit_target_transform: bool = False,
         max_rul: float = 125.0,
@@ -175,7 +178,21 @@ class StreamingCMAPSSDataset(Dataset):
         X_raw = df[features].values  
         self.unit_nrs = torch.tensor(df['unit_nr'].values, dtype=torch.int32)
         
-        # Apply scaling if provided (fit only on train set to avoid leakage)
+        # Extract and normalize time_cycles using the dedicated scaler
+        time_raw = df['time_cycles'].values.astype(np.float64).reshape(-1, 1)
+        
+        if fit_time_scaler and time_scaler is not None:
+            time_scaled = time_scaler.fit_transform(time_raw)
+        elif time_scaler is not None:
+            time_scaled = time_scaler.transform(time_raw)
+        else:
+            # Fallback to unscaled if no scaler is provided
+            time_scaled = time_raw
+
+        self.time_cycles = torch.tensor(time_scaled.reshape(-1), dtype=torch.float32)
+        self.time_scaler = time_scaler
+
+        # Apply scaling to features (fit only on train set to avoid leakage)
         if fit_scaler and scaler is not None:
             X_scaled = scaler.fit_transform(X_raw)
         elif scaler is not None:
@@ -183,8 +200,9 @@ class StreamingCMAPSSDataset(Dataset):
         else:
             X_scaled = X_raw
 
-            
         self.X = torch.tensor(X_scaled, dtype=torch.float32)
+        
+        # Target (RUL) processing
         y_vals = np.asarray(df['RUL'].values, dtype=np.float64).reshape(-1)
         if target_transform is None:
             target_transform = SmoothRULTargetTransform(max_rul=max_rul)
@@ -197,6 +215,7 @@ class StreamingCMAPSSDataset(Dataset):
         self.target_transform = target_transform
         y_transformed = self.target_transform.transform(y_vals)
         y_transformed = np.asarray(y_transformed, dtype=np.float32).reshape(-1, 1)
+        
         self.y = torch.tensor(y_transformed, dtype=torch.float32)
         self.y_raw = torch.tensor(y_vals, dtype=torch.float32).unsqueeze(1)
         self.scaler = scaler
@@ -205,8 +224,9 @@ class StreamingCMAPSSDataset(Dataset):
     def __len__(self) -> int:
         return len(self.X)
     
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return self.X[idx], self.y[idx], self.unit_nrs[idx]
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Yield a 4-tuple: (features, target, unit, time)
+        return self.X[idx], self.y[idx], self.unit_nrs[idx], self.time_cycles[idx]
 
     def inverse_transform(self, values, variance: Optional[Union[np.ndarray, torch.Tensor]] = None):
         return self.target_transform.inverse_transform(values, variance=variance)
