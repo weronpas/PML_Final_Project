@@ -1,89 +1,146 @@
+import sys
+from pathlib import Path
+
+import gpytorch
 import torch
 import torch.nn as nn
-import gpytorch
+from gpytorch.means import ConstantMean
 from gpytorch.models import ApproximateGP
 from gpytorch.variational import CholeskyVariationalDistribution, VariationalStrategy
-from gpytorch.means import ConstantMean
-
-
-import sys
-import warnings
-from pathlib import Path
 
 # Resolve project root dynamically
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
-# Importiamo il kernel custom fornito
 from src.models.kernels import DegradationKernel
 
-class AutoencoderFeatureExtractor(nn.Module):
-    """
-    Rete neurale Autoencoder. L'encoder estrae le feature per il GP (DKL), 
-    mentre il decoder serve a mantenere l'integrità delle feature ricostruendo l'input.
-    """
-    def __init__(self, input_dim: int, latent_dim: int, hidden_dim: int = 64):
-        super().__init__()
-        
-        # Encoder: mappa i dati originali nello spazio latente
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, latent_dim)
-        )
-        
-        # Decoder: ricostruisce i dati originali (usato durante il training)
-        self.decoder = nn.Sequential(
-            nn.Linear(latent_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, input_dim)
-        )
 
-    def forward(self, x):
-        # Il forward primario restituisce lo spazio latente per il GP
+class Encoder(nn.Module):
+    """Smooth feature projector for telemetry inputs."""
+
+    def __init__(self, input_dim: int, latent_dim: int = 8, hidden_dims: tuple[int, int] = (128, 64)):
+        super().__init__()
+        layer_dims = (input_dim, *hidden_dims, latent_dim)
+        layers = []
+        for index, (in_dim, out_dim) in enumerate(zip(layer_dims[:-1], layer_dims[1:])):
+            layers.append(nn.Linear(in_dim, out_dim))
+            if index < len(layer_dims) - 2:
+                layers.append(nn.LayerNorm(out_dim))
+                layers.append(nn.GELU())
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.network(x)
+
+
+class Decoder(nn.Module):
+    """Symmetric decoder that reconstructs the original telemetry space."""
+
+    def __init__(self, output_dim: int, latent_dim: int = 8, hidden_dims: tuple[int, int] = (64, 128)):
+        super().__init__()
+        layer_dims = (latent_dim, *hidden_dims, output_dim)
+        layers = []
+        for index, (in_dim, out_dim) in enumerate(zip(layer_dims[:-1], layer_dims[1:])):
+            layers.append(nn.Linear(in_dim, out_dim))
+            if index < len(layer_dims) - 2:
+                layers.append(nn.LayerNorm(out_dim))
+                layers.append(nn.GELU())
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        return self.network(z)
+
+
+class AutoencoderFeatureExtractor(nn.Module):
+    """Compatibility wrapper used by existing loaders and checkpoints."""
+
+    def __init__(self, input_dim: int, latent_dim: int = 8):
+        super().__init__()
+        self.input_dim = int(input_dim)
+        self.latent_dim = int(latent_dim)
+        self.encoder = Encoder(input_dim=input_dim, latent_dim=latent_dim)
+        self.decoder = Decoder(output_dim=input_dim, latent_dim=latent_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.encoder(x)
 
-    def reconstruct(self, x):
-        # Utilizzato per calcolare la reconstruction loss
+    def reconstruct(self, x: torch.Tensor) -> torch.Tensor:
         latent = self.encoder(x)
         return self.decoder(latent)
 
-class DKLAutoencoderSVGP(ApproximateGP):
-    """
-    Modello Deep Kernel Learning SVGP. 
-    Usa l'encoder dell'Autoencoder come feature extractor prima di applicare il DegradationKernel.
-    """
-    def __init__(self, feature_extractor: nn.Module, inducing_points: torch.Tensor, latent_dim: int):
-        # NOTA: gli inducing_points ora vivono nello SPAZIO LATENTE
+
+class LatentSpaceSVGP(ApproximateGP):
+    """Variational GP operating directly in the latent manifold."""
+
+    def __init__(self, inducing_points: torch.Tensor, latent_dim: int):
         variational_distribution = CholeskyVariationalDistribution(inducing_points.size(0))
-        
         variational_strategy = VariationalStrategy(
-            self, 
-            inducing_points, 
-            variational_distribution, 
-            learn_inducing_locations=True
+            self,
+            inducing_points,
+            variational_distribution,
+            learn_inducing_locations=True,
         )
         super().__init__(variational_strategy)
-        
-        self.feature_extractor = feature_extractor
-        
-        # Scala l'output della rete neurale per la stabilità del GP (comune nel DKL)
-        self.scale_to_bounds = gpytorch.utils.grid.ScaleToBounds(-1., 1.)
-        
-        # Componenti Core GP che usano la dimensionalità latente
+
         self.mean_module = ConstantMean()
-        # Usa il tuo Kernel informato dalla fisica
         self.covar_module = DegradationKernel(num_dimensions=latent_dim)
 
-    def forward(self, x):
-        # 1. Passa i dati crudi attraverso l'Encoder
-        projected_x = self.feature_extractor(x)
-        projected_x = self.scale_to_bounds(projected_x)
-        
-        # 2. GP Prior distribution sulle feature latenti
-        mean_x = self.mean_module(projected_x)
-        covar_x = self.covar_module(projected_x)
+    def forward(self, latent_x: torch.Tensor):
+        mean_x = self.mean_module(latent_x)
+        covar_x = self.covar_module(latent_x)
         return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
+
+
+class DKLAutoencoderSVGP(nn.Module):
+    """Autoencoder + latent GP composite used throughout the DKL pipeline."""
+
+    def __init__(self, feature_extractor: nn.Module, inducing_points: torch.Tensor, latent_dim: int):
+        super().__init__()
+
+        if hasattr(feature_extractor, 'encoder') and hasattr(feature_extractor, 'decoder'):
+            self.encoder = feature_extractor.encoder
+            self.decoder = feature_extractor.decoder
+            self.input_dim = getattr(feature_extractor, 'input_dim', None)
+        else:
+            self.encoder = feature_extractor
+            self.decoder = None
+            self.input_dim = None
+
+        self.latent_dim = int(latent_dim)
+        self.scale_to_bounds = gpytorch.utils.grid.ScaleToBounds(-1.0, 1.0)
+        self.gp_layer = LatentSpaceSVGP(inducing_points=inducing_points, latent_dim=self.latent_dim)
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        latent = self.encoder(x)
+        return self.scale_to_bounds(latent)
+
+    def reconstruct(self, x: torch.Tensor) -> torch.Tensor:
+        if self.decoder is None:
+            raise RuntimeError('Decoder is unavailable on this DKLAutoencoderSVGP instance.')
+        latent = self.encoder(x)
+        return self.decoder(latent)
+
+    def forward(self, x: torch.Tensor):
+        latent_x = self.encode(x)
+        return self.gp_layer(latent_x)
+
+    def predict_with_uncertainty(self, x: torch.Tensor, likelihood=None, confidence: float = 0.95):
+        with torch.no_grad(), gpytorch.settings.fast_pred_var():
+            posterior = self.forward(x)
+            predictive = likelihood(posterior) if likelihood is not None else posterior
+            mean = predictive.mean
+            variance = predictive.variance
+            std = torch.sqrt(torch.clamp(variance, min=1e-12))
+
+            z_value = 1.96 if abs(confidence - 0.95) < 1e-6 else 1.96
+            lower = mean - z_value * std
+            upper = mean + z_value * std
+
+        return {
+            'distribution': predictive,
+            'mean': mean,
+            'variance': variance,
+            'lower': lower,
+            'upper': upper,
+        }

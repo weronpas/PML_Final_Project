@@ -35,6 +35,11 @@ def evaluate_model_on_loader(model, data_loader, likelihood=None, device=None):
     if device is None:
         device = next(model.parameters()).device
 
+    target_inverse = None
+    dataset = getattr(data_loader, 'dataset', None)
+    if dataset is not None:
+        target_inverse = getattr(dataset, 'inverse_transform', None)
+
     was_training = model.training
     model.eval()
     if likelihood is not None:
@@ -56,8 +61,17 @@ def evaluate_model_on_loader(model, data_loader, likelihood=None, device=None):
             x = x.to(device)
             y = y.to(device)
 
-            prediction = model(x)
-            if isinstance(prediction, Distribution):
+            if hasattr(model, 'predict_with_uncertainty'):
+                prediction = model.predict_with_uncertainty(x, likelihood=likelihood)
+            else:
+                prediction = model(x)
+
+            if isinstance(prediction, dict):
+                batch_estimated_rul = prediction.get('mean')
+                batch_pred_var = prediction.get('variance')
+                batch_lower = prediction.get('lower')
+                batch_upper = prediction.get('upper')
+            elif isinstance(prediction, Distribution):
                 predictive_distribution = likelihood(prediction) if likelihood is not None else prediction
                 batch_estimated_rul = predictive_distribution.mean
                 batch_pred_var = predictive_distribution.variance
@@ -70,12 +84,32 @@ def evaluate_model_on_loader(model, data_loader, likelihood=None, device=None):
                 batch_lower = None
                 batch_upper = None
 
-            estimated_rul.extend(batch_estimated_rul.detach().cpu().view(-1).tolist())
-            true_rul.extend(y.detach().cpu().view(-1).tolist())
+            batch_estimated_rul = batch_estimated_rul.detach().cpu().view(-1).numpy()
+            batch_true = y.detach().cpu().view(-1).numpy()
             if batch_pred_var is not None:
-                predictive_vars.extend(batch_pred_var.detach().cpu().view(-1).tolist())
-                lower_bounds.extend(batch_lower.detach().cpu().view(-1).tolist())
-                upper_bounds.extend(batch_upper.detach().cpu().view(-1).tolist())
+                batch_pred_var = batch_pred_var.detach().cpu().view(-1).numpy()
+            if batch_lower is not None:
+                batch_lower = batch_lower.detach().cpu().view(-1).numpy()
+            if batch_upper is not None:
+                batch_upper = batch_upper.detach().cpu().view(-1).numpy()
+
+            if callable(target_inverse):
+                if batch_pred_var is not None:
+                    batch_estimated_rul, batch_pred_var = target_inverse(batch_estimated_rul, variance=batch_pred_var)
+                else:
+                    batch_estimated_rul = target_inverse(batch_estimated_rul)
+                batch_true = target_inverse(batch_true)
+                if batch_lower is not None:
+                    batch_lower = target_inverse(batch_lower)
+                if batch_upper is not None:
+                    batch_upper = target_inverse(batch_upper)
+
+            estimated_rul.extend(np.asarray(batch_estimated_rul).reshape(-1).tolist())
+            true_rul.extend(np.asarray(batch_true).reshape(-1).tolist())
+            if batch_pred_var is not None:
+                predictive_vars.extend(np.asarray(batch_pred_var).reshape(-1).tolist())
+                lower_bounds.extend(np.asarray(batch_lower).reshape(-1).tolist())
+                upper_bounds.extend(np.asarray(batch_upper).reshape(-1).tolist())
 
     if was_training:
         model.train()

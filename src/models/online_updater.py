@@ -28,7 +28,7 @@ from src.utils.metrics import (
 )
 from src.data.data_loader import StreamingCMAPSSDataset, load_cmapss_data, get_sensor_feature_columns
 from src.models.svgp import RotatingMachinerySVGP
-from src.models.dkl_autoencoder_svgp import DKLAutoencoderSVGP
+from src.models.dkl_autoencoder_svgp import DKLAutoencoderSVGP, AutoencoderFeatureExtractor
 
 
 def set_reproducible_seed(seed: int) -> None:
@@ -57,7 +57,7 @@ def simulate_online_stream_and_update(
     grad_clip_norm: float = 1.0,
     device: str = "cpu",
     collect_metrics: bool = False,
-    rul_scale_factor: float = 1.0  # <--- NEW: Denormalizes predictions to raw cycles
+    rul_scale_factor: float = 1.0,
 ):
     """
     Simulates a real-time sensor stream from C-MAPSS data, updating the model 
@@ -73,6 +73,11 @@ def simulate_online_stream_and_update(
     
     model.to(device)
     likelihood.to(device)
+
+    target_inverse = None
+    dataset = getattr(stream_loader, 'dataset', None)
+    if dataset is not None:
+        target_inverse = getattr(dataset, 'inverse_transform', None)
     
     # Storage buffers for streaming window data
     collected_x = []
@@ -95,22 +100,34 @@ def simulate_online_stream_and_update(
         
         # 1. STREAMING PREDICTION & UNCERTAINTY TRACKING (Debugging Goal)
         with torch.no_grad(), gpytorch.settings.fast_pred_var():
-            # Get posterior distribution through the strategy mapping
-            posterior_dist = model(x_step)
-            # Incorporate observation noise using the Gaussian likelihood
-            predictive_dist = likelihood(posterior_dist)
-            
-            # --- FIX APPLIED HERE: Denormalize Mean and Variance ---
-            # Multiply mean by the scale factor, and variance by the scale factor SQUARED
-            pred_mean = predictive_dist.mean.cpu().numpy() * rul_scale_factor
-            pred_variance = predictive_dist.variance.cpu().numpy() * (rul_scale_factor ** 2)
-            
-            # Track 95% Confidence Bounds (± 1.96 * standard deviation) using the true scaled variance
-            pred_std = np.sqrt(pred_variance)
-            lower_bound = pred_mean - (1.96 * pred_std)
-            upper_bound = pred_mean + (1.96 * pred_std)
-            
-            true_val = y_step.cpu().numpy().flatten()
+            if hasattr(model, 'predict_with_uncertainty'):
+                prediction = model.predict_with_uncertainty(x_step, likelihood=likelihood)
+                pred_mean = prediction['mean'].detach().cpu().numpy()
+                pred_variance = prediction['variance'].detach().cpu().numpy()
+                lower_bound = prediction['lower'].detach().cpu().numpy()
+                upper_bound = prediction['upper'].detach().cpu().numpy()
+            else:
+                posterior_dist = model(x_step)
+                predictive_dist = likelihood(posterior_dist)
+                pred_mean = predictive_dist.mean.detach().cpu().numpy()
+                pred_variance = predictive_dist.variance.detach().cpu().numpy()
+                pred_std = np.sqrt(np.maximum(pred_variance, 1e-12))
+                lower_bound = pred_mean - (1.96 * pred_std)
+                upper_bound = pred_mean + (1.96 * pred_std)
+
+            true_val = y_step.detach().cpu().numpy().flatten()
+
+            if callable(target_inverse):
+                pred_mean, pred_variance = target_inverse(pred_mean.flatten(), variance=pred_variance.flatten())
+                true_val = target_inverse(true_val)
+                lower_bound = target_inverse(lower_bound.flatten())
+                upper_bound = target_inverse(upper_bound.flatten())
+            elif rul_scale_factor != 1.0:
+                pred_mean = pred_mean * rul_scale_factor
+                pred_variance = pred_variance * (rul_scale_factor ** 2)
+                pred_std = np.sqrt(np.maximum(pred_variance, 1e-12))
+                lower_bound = pred_mean - (1.96 * pred_std)
+                upper_bound = pred_mean + (1.96 * pred_std)
             covered = (true_val >= lower_bound) & (true_val <= upper_bound)
             picp_step = np.mean(covered)
 
@@ -148,17 +165,19 @@ def simulate_online_stream_and_update(
             model.train()
             likelihood.train()
             
-            # Build parameter optimize lists based on the active architecture model
+            # Build parameter groups based on the active architecture model
             if is_dkl:
                 param_groups = [
-                    {'params': model.variational_strategy.parameters(), 'lr': lr},
-                    {'params': model.covar_module.parameters(), 'lr': lr * 0.25, 'weight_decay': weight_decay},
-                    {'params': model.mean_module.parameters(), 'lr': lr * 0.25}
+                    {'params': model.gp_layer.parameters(), 'lr': lr},
                 ]
                 if tune_feature_extractor:
                     param_groups.append(
-                        {'params': model.feature_extractor.parameters(), 'lr': lr * 0.1, 'weight_decay': weight_decay}
+                        {'params': model.encoder.parameters(), 'lr': lr * 0.1, 'weight_decay': weight_decay}
                     )
+                    if getattr(model, 'decoder', None) is not None:
+                        param_groups.append(
+                            {'params': model.decoder.parameters(), 'lr': lr * 0.1, 'weight_decay': weight_decay}
+                        )
                 # Keep likelihood noise calibrated during online adaptation to avoid overconfident collapse.
                 param_groups.append({'params': likelihood.parameters(), 'lr': lr * 0.1})
             else:
@@ -168,27 +187,20 @@ def simulate_online_stream_and_update(
                 ]
                 
             online_optimizer = torch.optim.Adam(param_groups)
+            mll = gpytorch.mlls.VariationalELBO(likelihood, model.gp_layer if is_dkl else model, num_data=X_update.size(0))
             
             # Fast streaming local optimization epochs
             for ft_epoch in range(fine_tune_epochs):
                 online_optimizer.zero_grad()
-                output = model(X_update)
-                
-                # --- FIX APPLIED HERE: Scale targets back down to [0, 1] for model training ---
-                scaled_y_update = y_update / rul_scale_factor
-                
-                if hasattr(output, 'log_prob'):
-                    loss_mll = -likelihood(output).log_prob(scaled_y_update.squeeze(-1)).mean()
-                else:
-                    loss_mll = negative_log_likelihood(output, scaled_y_update, likelihood=likelihood)
-                
-                # Calculate reconstruction preservation penalty if using DKL
-                if is_dkl:
-                    x_reconstructed = model.feature_extractor.reconstruct(X_update)
-                    loss_recon = F.mse_loss(x_reconstructed, X_update)
-                    total_loss = loss_mll + (lambda_recon * loss_recon)
-                else:
-                    total_loss = loss_mll
+                with gpytorch.settings.cholesky_jitter(1e-4):
+                    output = model(X_update)
+                    loss_mll = -mll(output, y_update.squeeze(-1))
+                    if is_dkl:
+                        x_reconstructed = model.reconstruct(X_update)
+                        loss_recon = F.mse_loss(x_reconstructed, X_update)
+                        total_loss = loss_mll + (lambda_recon * loss_recon)
+                    else:
+                        total_loss = loss_mll
                     
                 total_loss.backward()
                 if grad_clip_norm and grad_clip_norm > 0:
@@ -339,10 +351,7 @@ if __name__ == "__main__":
             raise ValueError(f"No sensor columns found for {fd_subset}")
 
         input_dim = len(features)
-        latent_dim = 4
-
-        # Use consistent RUL clipping/scale across all CMAPSS subsets.
-        df_train['RUL'] = df_train['RUL'].clip(upper=MAX_RUL_SCALE)
+        latent_dim = 8
 
         scaler = StandardScaler()
         train_dataset = StreamingCMAPSSDataset(
@@ -350,7 +359,8 @@ if __name__ == "__main__":
             features=features,
             scaler=scaler,
             fit_scaler=True,
-            target_scale=MAX_RUL_SCALE,
+            fit_target_transform=True,
+            max_rul=MAX_RUL_SCALE,
         )
         train_stream_loader = DataLoader(train_dataset, batch_size=1, shuffle=False)
         train_loader = DataLoader(train_dataset, batch_size=256, shuffle=True)
@@ -359,10 +369,12 @@ if __name__ == "__main__":
             train_loader=train_loader,
             input_dim=input_dim,
             latent_dim=latent_dim,
-            num_inducing=256,
+            num_inducing=500,
             epochs=70,
-            lr=0.0001,
-            lambda_recon=0.5,
+            encoder_lr=1e-4,
+            decoder_lr=1e-4,
+            gp_lr=1e-2,
+            lambda_recon=0.1,
             seed=seed,
         )
 
@@ -374,11 +386,10 @@ if __name__ == "__main__":
             update_every_x_cycles=10,
             fine_tune_epochs=1,
             lr=0.002,
-            lambda_recon=0.5,
+            lambda_recon=0.1,
             weight_decay=1e-4,
             tune_feature_extractor=False,
             grad_clip_norm=1.0,
-            rul_scale_factor=1.0,
         )
         dkl_model = train_results['model']
         dkl_likelihood = train_results['likelihood']
@@ -421,7 +432,7 @@ if __name__ == "__main__":
                     'subset': fd_subset,
                     'seed': int(seed),
                     'max_rul_scale': float(MAX_RUL_SCALE),
-                    'num_inducing': int(dkl_model.variational_strategy.inducing_points.size(0)),
+                    'num_inducing': int(dkl_model.gp_layer.variational_strategy.inducing_points.size(0)),
                     'input_dim': int(input_dim),
                     'latent_dim': int(latent_dim),
                     'features': list(features),
@@ -436,7 +447,6 @@ if __name__ == "__main__":
         print(f"\nRunning {fd_subset} TEST stream (with RUL labels) for evaluation only...")
         df_test = load_cmapss_data(test_path, rul_path)
         df_test = df_test.sort_values(['unit_nr', 'time_cycles']).reset_index(drop=True)
-        df_test['RUL'] = df_test['RUL'].clip(upper=MAX_RUL_SCALE)
 
         scaler_test = joblib.load(str(scaler_path))
         test_dataset = StreamingCMAPSSDataset(
@@ -444,7 +454,7 @@ if __name__ == "__main__":
             features=features,
             scaler=scaler_test,
             fit_scaler=False,
-            target_scale=1.0,
+            target_transform=train_dataset.target_transform,
         )
         test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
 
@@ -464,7 +474,7 @@ if __name__ == "__main__":
             latent_dim_test = int(ckpt_meta.get('latent_dim', latent_dim))
 
             fe_test = AutoencoderFeatureExtractor(input_dim=input_dim_test, latent_dim=latent_dim_test)
-            inducing_pts_input_test = torch.randn(num_inducing_test, input_dim_test)
+            inducing_pts_input_test = torch.randn(num_inducing_test, latent_dim_test)
             dkl_model_test = DKLAutoencoderSVGP(
                 feature_extractor=fe_test,
                 inducing_points=inducing_pts_input_test,
@@ -486,7 +496,6 @@ if __name__ == "__main__":
             lr=0.001,
             lambda_recon=0.0,
             collect_metrics=True,
-            rul_scale_factor=MAX_RUL_SCALE,
         )
 
         eval_dir = project_root / 'artifacts' / 'evaluation'
