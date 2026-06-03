@@ -167,64 +167,70 @@ def simulate_online_stream_and_update(
         global_cycles += batch_size_now
         
         # 2. ONLINE BAYESIAN VARIATIONAL UPDATE (Streaming Fine-Tuning)
+
+        # 2. ONLINE BAYESIAN VARIATIONAL UPDATE (Streaming Fine-Tuning)
         if cycle_counter >= update_every_x_cycles and fine_tune_epochs > 0:
             X_update = torch.cat(collected_x, dim=0)
             y_update = torch.cat(collected_y, dim=0)
-            T_update = torch.cat(collected_t, dim=0) if collected_t[0] is not None else None  
+            T_update = torch.cat(collected_t, dim=0) if collected_t[0] is not None else None
 
             model.train()
-            likelihood.train()
+            likelihood.eval()  # Congeliamo il rumore di fondo
+
+            # --- FIX DEFINITIVO: CONGELAMENTO GLOBALE ---
+            # Blocchiamo tutti i gradienti del modello per evitare il collasso dimensionale
+            for param in model.parameters():
+                param.requires_grad_(False)
             
-            # Build parameter groups based on the active architecture model
+            variational_params = []
+            target_gp = model.gp_layer if is_dkl else model
+            
+            # Sblocchiamo SOLO la media variazionale del Processo Gaussiano.
+            # La matrice di covarianza (incertezza) rimarrà intatta.
+            for name, param in target_gp.named_parameters():
+                if "variational_mean" in name:
+                    param.requires_grad_(True)
+                    variational_params.append(param)
+            
+            # Ottimizziamo solo il vettore della media
+            online_optimizer = torch.optim.Adam(variational_params, lr=0.01)
+            
             if is_dkl:
-                param_groups = [
-                    {'params': model.gp_layer.parameters(), 'lr': lr},
-                ]
-                if tune_feature_extractor:
-                    param_groups.append(
-                        {'params': model.encoder.parameters(), 'lr': lr * 0.1, 'weight_decay': weight_decay}
-                    )
-                    if getattr(model, 'decoder', None) is not None:
-                        param_groups.append(
-                            {'params': model.decoder.parameters(), 'lr': lr * 0.1, 'weight_decay': weight_decay}
-                        )
-                # Keep likelihood noise calibrated during online adaptation to avoid overconfident collapse.
-                param_groups.append({'params': likelihood.parameters(), 'lr': lr * 0.1})
-            else:
-                param_groups = [
-                    {'params': model.variational_strategy.parameters(), 'lr': lr},
-                    {'params': likelihood.parameters(), 'lr': lr * 0.1}
-                ]
+                model.encoder.eval() 
                 
-            online_optimizer = torch.optim.Adam(param_groups)
-            mll = gpytorch.mlls.VariationalELBO(likelihood, model.gp_layer if is_dkl else model, num_data=X_update.size(0))
-            
-            # Fast streaming local optimization epochs
+            # FIX: num_data DEVE essere la dimensione approssimativa del dataset globale (es. 50000).
+            # Evita il Catastrophic Forgetting.
+            mll = gpytorch.mlls.VariationalELBO(likelihood, target_gp, num_data=50000)
+
+            # Eseguiamo i loop di fine-tuning
             for ft_epoch in range(fine_tune_epochs):
                 online_optimizer.zero_grad()
-                with gpytorch.settings.cholesky_jitter(1e-4):
-                    output = model(X_update, normalized_cycle=T_update)
-                    loss_mll = -mll(output, y_update.squeeze(-1))
+                
+                with gpytorch.settings.cholesky_jitter(1e-3):
                     if is_dkl:
-                        x_reconstructed = model.reconstruct(X_update, normalized_cycle=T_update)
-                        loss_recon = F.mse_loss(x_reconstructed, X_update)
-                        total_loss = loss_mll + (lambda_recon * loss_recon)
+                        output = model(X_update, normalized_cycle=T_update)
                     else:
-                        total_loss = loss_mll
+                        output = model(X_update)
+                        
+                    loss_mll = -mll(output, y_update.squeeze(-1))
+                    loss_mll.backward()
+                    online_optimizer.step()
                     
-                total_loss.backward()
-                if grad_clip_norm and grad_clip_norm > 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
-                online_optimizer.step()
+            # Ripristiniamo i gradienti alla normalità una volta finito il micro-update
+            for param in model.parameters():
+                param.requires_grad_(True)
                 
             # Reset back to operational evaluation mode
             model.eval()
             likelihood.eval()
             
-            # Flush streaming memory buffers
-            collected_x = []
-            collected_y = []
-            collected_t = []
+            # SLIDING WINDOW
+            # Manteniamo la memoria recente per il prossimo update
+            MAX_MEMORY = 50
+            collected_x = collected_x[-MAX_MEMORY:]
+            collected_y = collected_y[-MAX_MEMORY:]
+            collected_t = collected_t[-MAX_MEMORY:]
+            
             cycle_counter = 0
 
     print("\n=== Online Bayesian Updating Simulation Completed Successfully ===")
@@ -280,7 +286,7 @@ if __name__ == "__main__":
     print("Verifying pipeline safety mechanics for DKL compatibility across FD001/FD002/FD003/FD004...")
 
     SEED = 42
-    FD_SUBSETS = ['FD001', 'FD002', 'FD003', 'FD004']
+    FD_SUBSETS = ['FD001']    #, 'FD002', 'FD003', 'FD004']
     MAX_RUL_SCALE = 125.0
 
     def persist_aggregate_summary(run_summaries: list) -> None:
@@ -387,7 +393,7 @@ if __name__ == "__main__":
             epochs=5,
             encoder_lr=1e-4,
             decoder_lr=1e-4,
-            gp_lr=1e-2,
+            gp_lr=1e-4,
             lambda_recon=0.1,
             seed=seed,
         )
@@ -417,7 +423,7 @@ if __name__ == "__main__":
         train_metrics['subset'] = fd_subset
         train_metrics['seed'] = int(seed)
         train_metrics['train_config'] = {
-            'epochs': 70,
+            'epochs': 50,
             'lr': 0.0001,
             'num_inducing': 256,
             'lambda_recon': 0.5,

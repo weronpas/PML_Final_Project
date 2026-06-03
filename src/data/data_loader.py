@@ -43,6 +43,11 @@ class SmoothRULTargetTransform:
     scaler: StandardScaler = field(default_factory=StandardScaler)
     fitted: bool = False
 
+    # Margin below max_rul where the inverse becomes numerically unstable.
+    # Values within 2 cycles of max_rul are physically indistinguishable ("saturated").
+    CLAMP_MARGIN: float = field(default=2.0, init=False, repr=False)
+    MAX_DERIVATIVE: float = field(default=50.0, init=False, repr=False)
+
     def fit(self, targets: Union[np.ndarray, torch.Tensor]) -> "SmoothRULTargetTransform":
         targets_array = np.asarray(targets, dtype=np.float64).reshape(-1, 1)
         self.scaler.fit(targets_array)
@@ -69,19 +74,26 @@ class SmoothRULTargetTransform:
         if not self.fitted:
             raise RuntimeError("SmoothRULTargetTransform must be fit before calling inverse_transform().")
 
+        safe_max = self.max_rul - self.CLAMP_MARGIN
+
         if torch.is_tensor(values):
             smooth_values = values * float(self.scaler.scale_[0]) + float(self.scaler.mean_[0])
+            smooth_values = torch.clamp(smooth_values, max=safe_max)
             raw_values = inverse_smooth_clip_rul(smooth_values, self.max_rul)
             if variance is None:
                 return raw_values
 
-            variance_tensor = variance if torch.is_tensor(variance) else torch.as_tensor(variance, dtype=values.dtype, device=values.device)
+            variance_tensor = (
+                variance if torch.is_tensor(variance)
+                else torch.as_tensor(variance, dtype=values.dtype, device=values.device)
+            )
             derivative = self._inverse_derivative_torch(smooth_values)
             raw_variance = variance_tensor * (derivative ** 2)
             return raw_values, raw_variance
 
         values_array = np.asarray(values, dtype=np.float64).reshape(-1)
         smooth_values = values_array * float(self.scaler.scale_[0]) + float(self.scaler.mean_[0])
+        smooth_values = np.clip(smooth_values, -np.inf, safe_max)
         raw_values = inverse_smooth_clip_rul(smooth_values, self.max_rul)
         if variance is None:
             return raw_values
@@ -101,17 +113,26 @@ class SmoothRULTargetTransform:
         return lower_raw, upper_raw
 
     def _inverse_derivative_numpy(self, smooth_values: np.ndarray) -> np.ndarray:
-        clipped = np.minimum(np.asarray(smooth_values, dtype=np.float64), self.max_rul - 1e-8)
-        exp_term = np.exp(self.max_rul - clipped)
-        return exp_term / np.maximum(exp_term - 1.0, 1e-8)
+        # smooth_values is already clamped to (max_rul - CLAMP_MARGIN) before this call
+        clipped = np.minimum(np.asarray(smooth_values, dtype=np.float64), self.max_rul - self.CLAMP_MARGIN)
+        exp_arg = np.clip(self.max_rul - clipped, 0.0, 50.0)
+        exp_term = np.exp(exp_arg)
+        derivative = exp_term / np.maximum(exp_term - 1.0, 1e-6)
+        return np.minimum(derivative, self.MAX_DERIVATIVE)
 
     def _inverse_derivative_torch(self, smooth_values: torch.Tensor) -> torch.Tensor:
-        max_rul_tensor = torch.as_tensor(self.max_rul, dtype=smooth_values.dtype, device=smooth_values.device)
-        clipped = torch.clamp(smooth_values, max=max_rul_tensor - 1e-8)
-        exp_term = torch.exp(max_rul_tensor - clipped)
-        return exp_term / torch.clamp(exp_term - 1.0, min=1e-8)
+        # smooth_values is already clamped to (max_rul - CLAMP_MARGIN) before this call
+        max_rul_t = torch.as_tensor(self.max_rul, dtype=smooth_values.dtype, device=smooth_values.device)
+        clipped = torch.clamp(smooth_values, max=max_rul_t - self.CLAMP_MARGIN)
+        exp_arg = torch.clamp(max_rul_t - clipped, min=0.0, max=50.0)
+        exp_term = torch.exp(exp_arg)
+        derivative = exp_term / torch.clamp(exp_term - 1.0, min=1e-6)
+        return torch.clamp(derivative, max=self.MAX_DERIVATIVE)
+    
 
 
+
+    
 def infer_cmapss_columns(file_path: str) -> List[str]:
     """Infer CMAPSS column names from a raw text file with whitespace-separated values."""
     with open(file_path, 'r') as fh:
