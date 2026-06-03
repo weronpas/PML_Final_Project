@@ -17,11 +17,14 @@ from src.models.kernels import DegradationKernel
 
 
 class Encoder(nn.Module):
-    """Smooth feature projector for telemetry inputs."""
-
-    def __init__(self, input_dim: int, latent_dim: int = 8, hidden_dims: tuple[int, int] = (128, 64)):
+    def __init__(self, input_dim: int, latent_dim: int = 8,
+                 hidden_dims: tuple[int, int] = (128, 64),
+                 use_time_input: bool = True):
         super().__init__()
-        layer_dims = (input_dim, *hidden_dims, latent_dim)
+        self.use_time_input = use_time_input
+        # +1 for the normalized cycle if enabled
+        effective_input = input_dim + (1 if use_time_input else 0)
+        layer_dims = (effective_input, *hidden_dims, latent_dim)
         layers = []
         for index, (in_dim, out_dim) in enumerate(zip(layer_dims[:-1], layer_dims[1:])):
             layers.append(nn.Linear(in_dim, out_dim))
@@ -30,7 +33,11 @@ class Encoder(nn.Module):
                 layers.append(nn.GELU())
         self.network = nn.Sequential(*layers)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor,
+                normalized_cycle: torch.Tensor | None = None) -> torch.Tensor:
+        if self.use_time_input and normalized_cycle is not None:
+            t = normalized_cycle.view(-1, 1)
+            x = torch.cat([x, t], dim=-1)
         return self.network(x)
 
 
@@ -62,11 +69,11 @@ class AutoencoderFeatureExtractor(nn.Module):
         self.encoder = Encoder(input_dim=input_dim, latent_dim=latent_dim)
         self.decoder = Decoder(output_dim=input_dim, latent_dim=latent_dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.encoder(x)
+    def forward(self, x: torch.Tensor, normalized_cycle: torch.Tensor | None = None) -> torch.Tensor:
+        return self.encoder(x, normalized_cycle)
 
-    def reconstruct(self, x: torch.Tensor) -> torch.Tensor:
-        latent = self.encoder(x)
+    def reconstruct(self, x: torch.Tensor, normalized_cycle: torch.Tensor | None = None) -> torch.Tensor:
+        latent = self.encoder(x, normalized_cycle)
         return self.decoder(latent)
 
 
@@ -111,29 +118,33 @@ class DKLAutoencoderSVGP(nn.Module):
         self.scale_to_bounds = gpytorch.utils.grid.ScaleToBounds(-1.0, 1.0)
         self.gp_layer = LatentSpaceSVGP(inducing_points=inducing_points, latent_dim=self.latent_dim)
 
-    def encode(self, x: torch.Tensor) -> torch.Tensor:
-        latent = self.encoder(x)
-        return self.scale_to_bounds(latent)
+    def encode(self, x: torch.Tensor, normalized_cycle: torch.Tensor | None = None) -> torch.Tensor:
+        latent = self.encoder(x, normalized_cycle)
+        return torch.tanh(latent) 
 
-    def reconstruct(self, x: torch.Tensor) -> torch.Tensor:
+    def reconstruct(self, x: torch.Tensor, normalized_cycle: torch.Tensor | None = None) -> torch.Tensor:
         if self.decoder is None:
             raise RuntimeError('Decoder is unavailable on this DKLAutoencoderSVGP instance.')
-        latent = self.encoder(x)
+        latent = self.encoder(x, normalized_cycle)
         return self.decoder(latent)
 
-    def forward(self, x: torch.Tensor):
-        latent_x = self.encode(x)
+    def forward(self, x: torch.Tensor, normalized_cycle: torch.Tensor | None = None):
+        latent_x = self.encode(x, normalized_cycle)
         return self.gp_layer(latent_x)
-
-    def predict_with_uncertainty(self, x: torch.Tensor, likelihood=None, confidence: float = 0.95):
+        
+    def predict_with_uncertainty(self, x: torch.Tensor, normalized_cycle: torch.Tensor | None = None, likelihood=None, confidence: float = 0.95):
         with torch.no_grad(), gpytorch.settings.fast_pred_var():
-            posterior = self.forward(x)
+            
+            # FIXED: Ensure normalized_cycle is passed into the forward pass here!
+            posterior = self.forward(x, normalized_cycle=normalized_cycle)
+            
             predictive = likelihood(posterior) if likelihood is not None else posterior
             mean = predictive.mean
             variance = predictive.variance
             std = torch.sqrt(torch.clamp(variance, min=1e-12))
 
-            z_value = 1.96 if abs(confidence - 0.95) < 1e-6 else 1.96
+            from scipy import stats
+            z_value = float(stats.norm.ppf((1 + confidence) / 2))
             lower = mean - z_value * std
             upper = mean + z_value * std
 

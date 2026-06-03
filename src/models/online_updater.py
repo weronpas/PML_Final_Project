@@ -1,6 +1,7 @@
 import sys
 import warnings
 from pathlib import Path
+from sklearn.preprocessing import MinMaxScaler
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -82,6 +83,7 @@ def simulate_online_stream_and_update(
     # Storage buffers for streaming window data
     collected_x = []
     collected_y = []
+    collected_t = []
     cycle_counter = 0
     global_cycles = 0
     
@@ -90,18 +92,24 @@ def simulate_online_stream_and_update(
 
     for batch_idx, batch in enumerate(stream_loader):
         # Unpack loader stream data
-        if len(batch) == 3:
+        if len(batch) == 4:
+            x_step, y_step, _, t_step = batch
+        elif len(batch) == 3:
             x_step, y_step, _ = batch
+            t_step = None
         else:
             x_step, y_step = batch
+            t_step = None
             
         x_step = x_step.to(device)
         y_step = y_step.to(device)
+        if t_step is not None:
+            t_step = t_step.to(device)
         
         # 1. STREAMING PREDICTION & UNCERTAINTY TRACKING (Debugging Goal)
         with torch.no_grad(), gpytorch.settings.fast_pred_var():
             if hasattr(model, 'predict_with_uncertainty'):
-                prediction = model.predict_with_uncertainty(x_step, likelihood=likelihood)
+                prediction = model.predict_with_uncertainty(x_step, normalized_cycle=t_step, likelihood=likelihood)
                 pred_mean = prediction['mean'].detach().cpu().numpy()
                 pred_variance = prediction['variance'].detach().cpu().numpy()
                 lower_bound = prediction['lower'].detach().cpu().numpy()
@@ -153,6 +161,7 @@ def simulate_online_stream_and_update(
         # Accumulate data for the upcoming streaming fine-tuning optimization step
         collected_x.append(x_step)
         collected_y.append(y_step)
+        collected_t.append(t_step)
         batch_size_now = len(x_step)
         cycle_counter += batch_size_now
         global_cycles += batch_size_now
@@ -161,7 +170,8 @@ def simulate_online_stream_and_update(
         if cycle_counter >= update_every_x_cycles and fine_tune_epochs > 0:
             X_update = torch.cat(collected_x, dim=0)
             y_update = torch.cat(collected_y, dim=0)
-            
+            T_update = torch.cat(collected_t, dim=0) if collected_t[0] is not None else None  
+
             model.train()
             likelihood.train()
             
@@ -193,10 +203,10 @@ def simulate_online_stream_and_update(
             for ft_epoch in range(fine_tune_epochs):
                 online_optimizer.zero_grad()
                 with gpytorch.settings.cholesky_jitter(1e-4):
-                    output = model(X_update)
+                    output = model(X_update, normalized_cycle=T_update)
                     loss_mll = -mll(output, y_update.squeeze(-1))
                     if is_dkl:
-                        x_reconstructed = model.reconstruct(X_update)
+                        x_reconstructed = model.reconstruct(X_update, normalized_cycle=T_update)
                         loss_recon = F.mse_loss(x_reconstructed, X_update)
                         total_loss = loss_mll + (lambda_recon * loss_recon)
                     else:
@@ -214,6 +224,7 @@ def simulate_online_stream_and_update(
             # Flush streaming memory buffers
             collected_x = []
             collected_y = []
+            collected_t = []
             cycle_counter = 0
 
     print("\n=== Online Bayesian Updating Simulation Completed Successfully ===")
@@ -353,24 +364,27 @@ if __name__ == "__main__":
         input_dim = len(features)
         latent_dim = 8
 
-        scaler = StandardScaler()
+        feature_scaler = StandardScaler()
+        time_scaler = MinMaxScaler()
+
         train_dataset = StreamingCMAPSSDataset(
             df=df_train,
             features=features,
-            scaler=scaler,
+            scaler=feature_scaler,
             fit_scaler=True,
-            fit_target_transform=True,
-            max_rul=MAX_RUL_SCALE,
+            time_scaler=time_scaler,          # Inject time scaler
+            fit_time_scaler=True,             # Learn train min/max
+            fit_target_transform=True
         )
         train_stream_loader = DataLoader(train_dataset, batch_size=1, shuffle=False)
-        train_loader = DataLoader(train_dataset, batch_size=256, shuffle=True)
+        train_loader = DataLoader(train_dataset, batch_size=256, shuffle=True, drop_last=True)
 
         dkl_model, dkl_likelihood = train_dkl_autoencoder(
             train_loader=train_loader,
-            input_dim=input_dim,
+            input_dim=len(features),
             latent_dim=latent_dim,
             num_inducing=500,
-            epochs=70,
+            epochs=5,
             encoder_lr=1e-4,
             decoder_lr=1e-4,
             gp_lr=1e-2,
@@ -440,7 +454,7 @@ if __name__ == "__main__":
             },
             str(ckpt_path),
         )
-        joblib.dump(scaler, str(scaler_path))
+        joblib.dump({'feature': feature_scaler, 'time': time_scaler}, str(scaler_path))
         print(f"Saved checkpoint to: {ckpt_path}")
 
         # --- Run TEST stream (with true RUL labels) for evaluation only ---
@@ -448,14 +462,20 @@ if __name__ == "__main__":
         df_test = load_cmapss_data(test_path, rul_path)
         df_test = df_test.sort_values(['unit_nr', 'time_cycles']).reset_index(drop=True)
 
-        scaler_test = joblib.load(str(scaler_path))
+        saved_scalers = joblib.load(str(scaler_path))
+        
+        # Apply to Test/Streaming Data
         test_dataset = StreamingCMAPSSDataset(
-            df=df_test,
-            features=features,
-            scaler=scaler_test,
+            df=df_test,                                # FIXED
+            features=features,                         # FIXED
+            scaler=saved_scalers['feature'],           # FIXED: Use loaded scaler
             fit_scaler=False,
+            time_scaler=saved_scalers['time'],         # FIXED: Use loaded scaler
+            fit_time_scaler=False,                     
             target_transform=train_dataset.target_transform,
+            fit_target_transform=False
         )
+
         test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
 
         dkl_model_test = None
