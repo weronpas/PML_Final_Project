@@ -127,7 +127,7 @@ def get_sensor_feature_columns(df: pd.DataFrame) -> List[str]:
     sensor_cols.sort(key=lambda c: int(c.split('_')[1]) if c.split('_')[1].isdigit() else c)
     return sensor_cols
 
-def load_cmapss_data(file_path: str, rul_file_path: Optional[str] = None, max_rul: Optional[int] = 125, smooth_targets: bool = True) -> pd.DataFrame:
+def load_cmapss_data(file_path: str, rul_file_path: Optional[str] = None, max_rul: Optional[int] = 125, smooth_targets: bool = False) -> pd.DataFrame:
     # Infer columns so the same code works across FD001/FD002/FD003/FD004 variants.
     col_names = infer_cmapss_columns(file_path)
     df = pd.read_csv(file_path, sep=r'\s+', header=None, names=col_names)
