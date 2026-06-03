@@ -120,7 +120,10 @@ class DKLAutoencoderSVGP(nn.Module):
 
     def encode(self, x: torch.Tensor, normalized_cycle: torch.Tensor | None = None) -> torch.Tensor:
         latent = self.encoder(x, normalized_cycle)
-        return torch.tanh(latent) 
+        # Usa ScaleToBounds invece di tanh: mappa linearmente nell'intervallo [-1, 1]
+        # senza saturare i gradienti né comprimere le distanze nel latent space
+        return self.scale_to_bounds(latent)  # ← sostituisce torch.tanh(latent)
+
 
     def reconstruct(self, x: torch.Tensor, normalized_cycle: torch.Tensor | None = None) -> torch.Tensor:
         if self.decoder is None:
@@ -132,12 +135,15 @@ class DKLAutoencoderSVGP(nn.Module):
         latent_x = self.encode(x, normalized_cycle)
         return self.gp_layer(latent_x)
         
-    def predict_with_uncertainty(self, x: torch.Tensor, normalized_cycle: torch.Tensor | None = None, likelihood=None, confidence: float = 0.95):
-        with torch.no_grad(), gpytorch.settings.fast_pred_var():
-            
-            # FIXED: Ensure normalized_cycle is passed into the forward pass here!
+    def predict_with_uncertainty(
+        self,
+        x: torch.Tensor,
+        normalized_cycle: torch.Tensor | None = None,
+        likelihood=None,
+        confidence: float = 0.95,
+    ):
+        with torch.no_grad(), gpytorch.settings.fast_pred_var(False):  # ← disabilita l'approssimazione
             posterior = self.forward(x, normalized_cycle=normalized_cycle)
-            
             predictive = likelihood(posterior) if likelihood is not None else posterior
             mean = predictive.mean
             variance = predictive.variance

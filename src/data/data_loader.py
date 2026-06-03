@@ -101,6 +101,7 @@ class SmoothRULTargetTransform:
         variance_array = np.asarray(variance, dtype=np.float64).reshape(-1)
         derivative = self._inverse_derivative_numpy(smooth_values)
         raw_variance = variance_array * (derivative ** 2)
+
         return raw_values, raw_variance
 
     def inverse_interval(
@@ -113,25 +114,28 @@ class SmoothRULTargetTransform:
         return lower_raw, upper_raw
 
     def _inverse_derivative_numpy(self, smooth_values: np.ndarray) -> np.ndarray:
-        # smooth_values is already clamped to (max_rul - CLAMP_MARGIN) before this call
         clipped = np.minimum(np.asarray(smooth_values, dtype=np.float64), self.max_rul - self.CLAMP_MARGIN)
         exp_arg = np.clip(self.max_rul - clipped, 0.0, 50.0)
         exp_term = np.exp(exp_arg)
-        derivative = exp_term / np.maximum(exp_term - 1.0, 1e-6)
-        return np.minimum(derivative, self.MAX_DERIVATIVE)
+        deriv_clip = exp_term / np.maximum(exp_term - 1.0, 1e-6)
+        deriv_clip = np.minimum(deriv_clip, self.MAX_DERIVATIVE)
+        
+        # ✅ Chain rule: includi il fattore dello scaler
+        full_deriv = deriv_clip * float(self.scaler.scale_[0])
+        return full_deriv
 
     def _inverse_derivative_torch(self, smooth_values: torch.Tensor) -> torch.Tensor:
-        # smooth_values is already clamped to (max_rul - CLAMP_MARGIN) before this call
         max_rul_t = torch.as_tensor(self.max_rul, dtype=smooth_values.dtype, device=smooth_values.device)
         clipped = torch.clamp(smooth_values, max=max_rul_t - self.CLAMP_MARGIN)
         exp_arg = torch.clamp(max_rul_t - clipped, min=0.0, max=50.0)
         exp_term = torch.exp(exp_arg)
-        derivative = exp_term / torch.clamp(exp_term - 1.0, min=1e-6)
-        return torch.clamp(derivative, max=self.MAX_DERIVATIVE)
-    
+        deriv_clip = exp_term / torch.clamp(exp_term - 1.0, min=1e-6)
+        deriv_clip = torch.clamp(deriv_clip, max=self.MAX_DERIVATIVE)
 
-
-
+        # ✅ Chain rule: includi il fattore dello scaler
+        scale = torch.as_tensor(float(self.scaler.scale_[0]), dtype=smooth_values.dtype, device=smooth_values.device)
+        full_deriv = deriv_clip * scale
+        return full_deriv
     
 def infer_cmapss_columns(file_path: str) -> List[str]:
     """Infer CMAPSS column names from a raw text file with whitespace-separated values."""
