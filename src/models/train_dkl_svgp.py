@@ -1,7 +1,9 @@
 import torch
 import torch.nn.functional as F
+import gpytorch
+from sklearn.cluster import KMeans
 from gpytorch.likelihoods import GaussianLikelihood
-from src.utils.metrics import negative_log_likelihood, evaluate_model_on_loader
+from src.utils.metrics import evaluate_model_on_loader
 
 
 def set_reproducible_seed(seed: int) -> None:
@@ -18,7 +20,36 @@ def set_reproducible_seed(seed: int) -> None:
     except Exception:
         pass
 
-def train_dkl_autoencoder(train_loader, input_dim, latent_dim=4, num_inducing=256, epochs=30, lr=0.001, encoder_lr=None, gp_lr=None, weight_decay=1e-5, lambda_recon=0.5, learn_likelihood_noise=True, init_likelihood_noise=0.01, label_noise_std=0.01, seed: int | None = None):
+def _collect_latent_embeddings(feature_extractor, train_loader, device):
+    feature_extractor.eval()
+    latents = []
+    with torch.no_grad():
+        for batch in train_loader:
+            x = batch[0].to(device)
+            latents.append(feature_extractor.encoder(x).detach().cpu())
+    feature_extractor.train()
+    if not latents:
+        raise ValueError('Unable to collect latent embeddings from an empty training loader.')
+    return torch.cat(latents, dim=0)
+
+
+def train_dkl_autoencoder(
+    train_loader,
+    input_dim,
+    latent_dim=8,
+    num_inducing=500,
+    epochs=30,
+    lr=0.001,
+    encoder_lr=None,
+    decoder_lr=None,
+    gp_lr=None,
+    weight_decay=1e-5,
+    lambda_recon=0.1,
+    learn_likelihood_noise=True,
+    init_likelihood_noise=0.01,
+    label_noise_std=0.0,
+    seed: int | None = None,
+):
     from src.models.dkl_autoencoder_svgp import AutoencoderFeatureExtractor, DKLAutoencoderSVGP
 
     if seed is not None:
@@ -27,13 +58,17 @@ def train_dkl_autoencoder(train_loader, input_dim, latent_dim=4, num_inducing=25
     # 1. Inizializza il feature extractor (Autoencoder)
     feature_extractor = AutoencoderFeatureExtractor(input_dim=input_dim, latent_dim=latent_dim)
     
-    # 2. Inizializza gli inducing points nello SPAZIO INPUT (compatibile con la VariationalStrategy)
-    first_batch = next(iter(train_loader))
-    x_init_batch = first_batch[0]
-    inducing_points = x_init_batch[:num_inducing].clone()
-
+    # 2. Initialize inducing points in the latent space using K-Means centroids.
+    device = next(feature_extractor.parameters()).device
+    latent_embeddings = _collect_latent_embeddings(feature_extractor, train_loader, device=device)
+    latent_np = latent_embeddings.numpy()
+    n_clusters = min(int(num_inducing), int(latent_np.shape[0]))
+    kmeans = KMeans(n_clusters=n_clusters, random_state=seed if seed is not None else 42, n_init=10)
+    kmeans.fit(latent_np)
+    inducing_points = torch.tensor(kmeans.cluster_centers_, dtype=torch.float32, device=device)
     if inducing_points.size(0) < num_inducing:
-        inducing_points = torch.randn(num_inducing, input_dim)
+        repeat_idx = torch.randint(0, inducing_points.size(0), (num_inducing - inducing_points.size(0),), device=device)
+        inducing_points = torch.cat([inducing_points, inducing_points[repeat_idx]], dim=0)
 
     # 3. Setup del Modello e Likelihood
     model = DKLAutoencoderSVGP(feature_extractor, inducing_points, latent_dim)
@@ -51,20 +86,22 @@ def train_dkl_autoencoder(train_loader, input_dim, latent_dim=4, num_inducing=25
     model.train()
     likelihood.train()
 
-    # 4. Ottimizzatore congiunto con learning-rate groups
-    # Backwards-compatible lr handling: if gp_lr/encoder_lr not provided, derive from lr
-    if gp_lr is None:
-        gp_lr = lr
+    # 4. Split optimization between representation learning and GP fitting.
     if encoder_lr is None:
-        encoder_lr = lr * 0.1
+        encoder_lr = 1e-4
+    if decoder_lr is None:
+        decoder_lr = 1e-4
+    if gp_lr is None:
+        gp_lr = 1e-2
 
     optimizer = torch.optim.Adam([
-        {'params': model.feature_extractor.parameters(), 'lr': encoder_lr, 'weight_decay': weight_decay},
-        {'params': model.covar_module.parameters(), 'lr': gp_lr},
-        {'params': model.mean_module.parameters(), 'lr': gp_lr},
-        {'params': model.variational_parameters(), 'lr': gp_lr},
-        {'params': likelihood.parameters(), 'lr': gp_lr},
+        {'params': feature_extractor.encoder.parameters(), 'lr': encoder_lr, 'weight_decay': weight_decay},
+        {'params': feature_extractor.decoder.parameters(), 'lr': decoder_lr, 'weight_decay': weight_decay},
+        {'params': model.gp_layer.parameters(), 'lr': gp_lr},
+        {'params': likelihood.parameters(), 'lr': gp_lr * 0.1},
     ])
+
+    mll = gpytorch.mlls.VariationalELBO(likelihood, model.gp_layer, num_data=len(train_loader.dataset))
 
     print(f"--- Starting DKL Autoencoder SVGP Training ({epochs} Epochs) ---")
     for epoch in range(epochs):
@@ -77,32 +114,27 @@ def train_dkl_autoencoder(train_loader, input_dim, latent_dim=4, num_inducing=25
             else:
                 x, y = batch
 
-            # Add small Gaussian label noise as an aleatoric regularizer
+            # Add small Gaussian label noise only when explicitly requested.
             if label_noise_std and label_noise_std > 0.0:
                 y_noisy = y + (torch.randn_like(y) * float(label_noise_std))
             else:
                 y_noisy = y
             optimizer.zero_grad()
-            
-            # --- TASK 1: Regressione RUL (SVGP) ---
-            output = model(x)
-            loss_mll = negative_log_likelihood(output, y_noisy, likelihood=likelihood)
-            
-            # --- TASK 2: Ricostruzione (Autoencoder) ---
-            x_reconstructed = model.feature_extractor.reconstruct(x)
-            loss_recon = F.mse_loss(x_reconstructed, x)
-            
-            # --- Loss Totale Combinata ---
-            # lambda_recon bilancia l'importanza della ricostruzione rispetto alla prediction del GP
-            total_loss = loss_mll + (lambda_recon * loss_recon)
-            
+
+            with gpytorch.settings.cholesky_jitter(1e-4):
+                output = model(x)
+                variational_elbo = mll(output, y_noisy.squeeze(-1))
+                x_reconstructed = feature_extractor.reconstruct(x)
+                loss_recon = F.mse_loss(x_reconstructed, x)
+                total_loss = (-1.0 * variational_elbo) + (lambda_recon * loss_recon)
+
             total_loss.backward()
             optimizer.step()
             
-            epoch_mll_loss += loss_mll.item()
+            epoch_mll_loss += float((-1.0 * variational_elbo).item())
             epoch_recon_loss += loss_recon.item()
             
-        print(f"Epoch {epoch+1:02d} | MLL Loss: {epoch_mll_loss/len(train_loader):.4f} | Recon Loss: {epoch_recon_loss/len(train_loader):.4f}")
+        print(f"Epoch {epoch+1:02d} | ELBO Loss: {epoch_mll_loss/len(train_loader):.4f} | Recon Loss: {epoch_recon_loss/len(train_loader):.4f}")
 
     final_report = evaluate_model_on_loader(model, train_loader, likelihood=likelihood)
     print("DKL Autoencoder SVGP Training Evaluation Summary:")

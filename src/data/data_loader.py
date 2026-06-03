@@ -1,12 +1,114 @@
 import pandas as pd
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset
 from sklearn.preprocessing import StandardScaler
-from typing import Tuple, List, Optional
+from dataclasses import dataclass, field
+from typing import Tuple, List, Optional, Union
 
 
 BASE_CMAPSS_COLUMNS = ['unit_nr', 'time_cycles', 'setting_1', 'setting_2', 'setting_3']
+
+
+def smooth_clip_rul(values: Union[np.ndarray, torch.Tensor], max_rul: float) -> Union[np.ndarray, torch.Tensor]:
+    """Apply a smooth approximation of min(values, max_rul)."""
+    if torch.is_tensor(values):
+        max_rul_tensor = torch.as_tensor(max_rul, dtype=values.dtype, device=values.device)
+        return max_rul_tensor - F.softplus(max_rul_tensor - values)
+
+    values_array = np.asarray(values, dtype=np.float64)
+    return max_rul - np.logaddexp(0.0, max_rul - values_array)
+
+
+def inverse_smooth_clip_rul(values: Union[np.ndarray, torch.Tensor], max_rul: float) -> Union[np.ndarray, torch.Tensor]:
+    """Invert the smooth clipping transform on values strictly below max_rul."""
+    eps = 1e-8
+    if torch.is_tensor(values):
+        max_rul_tensor = torch.as_tensor(max_rul, dtype=values.dtype, device=values.device)
+        clipped = torch.clamp(values, max=max_rul_tensor - eps)
+        return max_rul_tensor - torch.log(torch.expm1(max_rul_tensor - clipped))
+
+    values_array = np.asarray(values, dtype=np.float64)
+    clipped = np.minimum(values_array, max_rul - eps)
+    return max_rul - np.log(np.expm1(max_rul - clipped))
+
+
+@dataclass
+class SmoothRULTargetTransform:
+    """Standardize smooth-clipped RUL targets and invert them back to cycles."""
+
+    max_rul: float = 125.0
+    scaler: StandardScaler = field(default_factory=StandardScaler)
+    fitted: bool = False
+
+    def fit(self, targets: Union[np.ndarray, torch.Tensor]) -> "SmoothRULTargetTransform":
+        targets_array = np.asarray(targets, dtype=np.float64).reshape(-1, 1)
+        self.scaler.fit(targets_array)
+        self.fitted = True
+        return self
+
+    def transform(self, targets: Union[np.ndarray, torch.Tensor]) -> Union[np.ndarray, torch.Tensor]:
+        if not self.fitted:
+            raise RuntimeError("SmoothRULTargetTransform must be fit before calling transform().")
+
+        if torch.is_tensor(targets):
+            transformed = (targets - float(self.scaler.mean_[0])) / float(self.scaler.scale_[0])
+            return transformed
+
+        targets_array = np.asarray(targets, dtype=np.float64).reshape(-1, 1)
+        transformed = self.scaler.transform(targets_array).reshape(-1)
+        return transformed
+
+    def inverse_transform(
+        self,
+        values: Union[np.ndarray, torch.Tensor],
+        variance: Optional[Union[np.ndarray, torch.Tensor]] = None,
+    ):
+        if not self.fitted:
+            raise RuntimeError("SmoothRULTargetTransform must be fit before calling inverse_transform().")
+
+        if torch.is_tensor(values):
+            smooth_values = values * float(self.scaler.scale_[0]) + float(self.scaler.mean_[0])
+            raw_values = inverse_smooth_clip_rul(smooth_values, self.max_rul)
+            if variance is None:
+                return raw_values
+
+            variance_tensor = variance if torch.is_tensor(variance) else torch.as_tensor(variance, dtype=values.dtype, device=values.device)
+            derivative = self._inverse_derivative_torch(smooth_values)
+            raw_variance = variance_tensor * (derivative ** 2)
+            return raw_values, raw_variance
+
+        values_array = np.asarray(values, dtype=np.float64).reshape(-1)
+        smooth_values = values_array * float(self.scaler.scale_[0]) + float(self.scaler.mean_[0])
+        raw_values = inverse_smooth_clip_rul(smooth_values, self.max_rul)
+        if variance is None:
+            return raw_values
+
+        variance_array = np.asarray(variance, dtype=np.float64).reshape(-1)
+        derivative = self._inverse_derivative_numpy(smooth_values)
+        raw_variance = variance_array * (derivative ** 2)
+        return raw_values, raw_variance
+
+    def inverse_interval(
+        self,
+        lower: Union[np.ndarray, torch.Tensor],
+        upper: Union[np.ndarray, torch.Tensor],
+    ) -> Tuple[Union[np.ndarray, torch.Tensor], Union[np.ndarray, torch.Tensor]]:
+        lower_raw = self.inverse_transform(lower)
+        upper_raw = self.inverse_transform(upper)
+        return lower_raw, upper_raw
+
+    def _inverse_derivative_numpy(self, smooth_values: np.ndarray) -> np.ndarray:
+        clipped = np.minimum(np.asarray(smooth_values, dtype=np.float64), self.max_rul - 1e-8)
+        exp_term = np.exp(self.max_rul - clipped)
+        return exp_term / np.maximum(exp_term - 1.0, 1e-8)
+
+    def _inverse_derivative_torch(self, smooth_values: torch.Tensor) -> torch.Tensor:
+        max_rul_tensor = torch.as_tensor(self.max_rul, dtype=smooth_values.dtype, device=smooth_values.device)
+        clipped = torch.clamp(smooth_values, max=max_rul_tensor - 1e-8)
+        exp_term = torch.exp(max_rul_tensor - clipped)
+        return exp_term / torch.clamp(exp_term - 1.0, min=1e-8)
 
 
 def infer_cmapss_columns(file_path: str) -> List[str]:
@@ -25,7 +127,7 @@ def get_sensor_feature_columns(df: pd.DataFrame) -> List[str]:
     sensor_cols.sort(key=lambda c: int(c.split('_')[1]) if c.split('_')[1].isdigit() else c)
     return sensor_cols
 
-def load_cmapss_data(file_path: str, rul_file_path: Optional[str] = None, max_rul: Optional[int] = 125) -> pd.DataFrame:
+def load_cmapss_data(file_path: str, rul_file_path: Optional[str] = None, max_rul: Optional[int] = 125, smooth_targets: bool = True) -> pd.DataFrame:
     # Infer columns so the same code works across FD001/FD002/FD003/FD004 variants.
     col_names = infer_cmapss_columns(file_path)
     df = pd.read_csv(file_path, sep=r'\s+', header=None, names=col_names)
@@ -50,17 +152,28 @@ def load_cmapss_data(file_path: str, rul_file_path: Optional[str] = None, max_ru
         df['RUL'] = df['RUL_end'] + df['max_test_cycles'] - df['time_cycles']
         df = df.drop(columns=['max_test_cycles', 'RUL_end'])
         
-    # Limita la RUL massima a max_rul (es. 125) per modellare il degrado piecewise-linear
+    # Apply a smooth saturation at max_rul so the training target remains differentiable.
     if max_rul is not None:
-        df['RUL'] = df['RUL'].clip(upper=max_rul)
+        if smooth_targets:
+            df['RUL'] = smooth_clip_rul(df['RUL'].values, float(max_rul))
+        else:
+            df['RUL'] = df['RUL'].clip(upper=max_rul)
 
     return df
 
 class StreamingCMAPSSDataset(Dataset):
-    def __init__(self, df: pd.DataFrame, features: List[str], scaler: Optional[StandardScaler] = None, fit_scaler: bool = False, target_scale: float = 1.0):
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        features: List[str],
+        scaler: Optional[StandardScaler] = None,
+        fit_scaler: bool = False,
+        target_transform: Optional[SmoothRULTargetTransform] = None,
+        fit_target_transform: bool = False,
+        max_rul: float = 125.0,
+    ):
         X_raw = df[features].values  
-        self.unit_nrs = torch.tensor(df['unit_nr'].values, dtype=torch.int32) # Aggiungi questa riga
-    
+        self.unit_nrs = torch.tensor(df['unit_nr'].values, dtype=torch.int32)
         
         # Apply scaling if provided (fit only on train set to avoid leakage)
         if fit_scaler and scaler is not None:
@@ -72,17 +185,28 @@ class StreamingCMAPSSDataset(Dataset):
 
             
         self.X = torch.tensor(X_scaled, dtype=torch.float32)
-        # Targets: optionally scale RUL by `target_scale` so training can use 0-1 targets.
-        # If target_scale == 1.0 this preserves raw RUL values (0..MAX_RUL).
-        y_vals = df['RUL'].values.astype(float)
-        if target_scale and float(target_scale) != 1.0:
-            y_vals = y_vals / float(target_scale)
-        # Target must be shape (N, 1) for GPyTorch/PyTorch loss functions
-        self.y = torch.tensor(y_vals, dtype=torch.float32).unsqueeze(1)
+        y_vals = np.asarray(df['RUL'].values, dtype=np.float64).reshape(-1)
+        if target_transform is None:
+            target_transform = SmoothRULTargetTransform(max_rul=max_rul)
+
+        if fit_target_transform:
+            target_transform.fit(y_vals)
+        elif not target_transform.fitted:
+            raise ValueError("target_transform must be fitted or fit_target_transform=True for StreamingCMAPSSDataset.")
+
+        self.target_transform = target_transform
+        y_transformed = self.target_transform.transform(y_vals)
+        y_transformed = np.asarray(y_transformed, dtype=np.float32).reshape(-1, 1)
+        self.y = torch.tensor(y_transformed, dtype=torch.float32)
+        self.y_raw = torch.tensor(y_vals, dtype=torch.float32).unsqueeze(1)
         self.scaler = scaler
+        self.max_rul = float(max_rul)
         
     def __len__(self) -> int:
         return len(self.X)
     
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-            return self.X[idx], self.y[idx], self.unit_nrs[idx]
+        return self.X[idx], self.y[idx], self.unit_nrs[idx]
+
+    def inverse_transform(self, values, variance: Optional[Union[np.ndarray, torch.Tensor]] = None):
+        return self.target_transform.inverse_transform(values, variance=variance)
