@@ -15,6 +15,5 @@ __pycache__/
 
 # Models
 *.pt
-*.pth
 
 *.DS_Store
