@@ -6,7 +6,11 @@ import torch
 import torch.nn as nn
 from gpytorch.means import ConstantMean
 from gpytorch.models import ApproximateGP
-from gpytorch.variational import CholeskyVariationalDistribution, VariationalStrategy
+from gpytorch.variational import (
+    NaturalVariationalDistribution,   # sostituisce CholeskyVariationalDistribution
+    VariationalStrategy,
+)
+
 
 # Resolve project root dynamically
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -81,7 +85,7 @@ class LatentSpaceSVGP(ApproximateGP):
     """Variational GP operating directly in the latent manifold."""
 
     def __init__(self, inducing_points: torch.Tensor, latent_dim: int):
-        variational_distribution = CholeskyVariationalDistribution(inducing_points.size(0))
+        variational_distribution = NaturalVariationalDistribution(inducing_points.size(0))
         variational_strategy = VariationalStrategy(
             self,
             inducing_points,

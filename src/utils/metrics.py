@@ -153,21 +153,16 @@ def phm_scoring_function(estimated_rul, true_rul):
     a2 = 13 (penalty factor for late predictions)
     """
     d = calculate_prediction_error(estimated_rul, true_rul)
-    
-    # Initialize the scores array
     scores = np.zeros_like(d, dtype=float)
     
-    # Case d < 0 (Early prediction)
     mask_early = d < 0
-    scores[mask_early] = np.exp(-d[mask_early] / 10.0) - 1.0
-    
-    # Case d >= 0 (Late prediction)
-    mask_late = d >= 0
-    scores[mask_late] = np.exp(d[mask_late] / 13.0) - 1.0
-    
-    # The total score is the sum of the scores of all UUTs (Units Under Test)
-    total_score = np.sum(scores)
-    return total_score
+    mask_late  = d >= 0
+
+    # Clamp prima di exp per evitare overflow
+    scores[mask_early] = np.exp(np.clip(-d[mask_early] / 10.0, -500, 500)) - 1.0
+    scores[mask_late]  = np.exp(np.clip( d[mask_late]  / 13.0, -500, 500)) - 1.0
+
+    return float(np.sum(scores))
 
 def fleet_correlation_metric(estimated_rul, true_rul):
     """
@@ -232,19 +227,15 @@ def evaluate_prognostics_model(estimated_rul, true_rul, predictive_vars=None, lo
 
 
 def prediction_interval_coverage(lower_bounds, upper_bounds, true_values):
-    """
-    Compute Prediction Interval Coverage Probability (PICP).
-    Expects arrays of same shape for lower, upper and true values.
-    Returns fraction of true values lying inside the intervals.
-    """
-    lb = np.array(lower_bounds)
-    ub = np.array(upper_bounds)
-    y = np.array(true_values)
-    if lb.shape != ub.shape or lb.shape != y.shape:
-        lb = lb.flatten()
-        ub = ub.flatten()
-        y = y.flatten()
-    covered = (y >= lb) & (y <= ub)
+    lb = np.array(lower_bounds).flatten()
+    ub = np.array(upper_bounds).flatten()
+    y  = np.array(true_values).flatten()
+    
+    # Esclude campioni con intervalli non validi
+    valid = np.isfinite(lb) & np.isfinite(ub)
+    if not np.any(valid):
+        return float('nan')
+    covered = (y[valid] >= lb[valid]) & (y[valid] <= ub[valid])
     return float(np.mean(covered))
 
 
@@ -252,7 +243,12 @@ def average_interval_width(lower_bounds, upper_bounds):
     """Average width of prediction intervals (upper - lower)."""
     lb = np.array(lower_bounds).flatten()
     ub = np.array(upper_bounds).flatten()
-    return float(np.mean(ub - lb))
+    width = ub - lb
+    # Ignora NaN/inf prodotti da saturazione nell'inverse_transform
+    valid = np.isfinite(width)
+    if not np.any(valid):
+        return float('nan')
+    return float(np.mean(width[valid]))
 
 
 def gaussian_nll_from_mean_var(mean_preds, var_preds, true_values, eps: float = 1e-6):

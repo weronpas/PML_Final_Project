@@ -4,6 +4,7 @@ import gpytorch
 from sklearn.cluster import KMeans
 from gpytorch.likelihoods import GaussianLikelihood
 from src.utils.metrics import evaluate_model_on_loader
+from gpytorch.optim import NGD  # Natural Gradient Descent
 
 
 def set_reproducible_seed(seed: int) -> None:
@@ -49,10 +50,7 @@ def train_dkl_autoencoder(
     gp_lr=None,
     weight_decay=1e-5,
     lambda_recon=1.0,       # raised from 0.1 — forces a structured latent space
-    lambda_asymm=0.5,       # weight for PHM asymmetric penalty (late preds cost more)
-    asymm_late_penalty=1.5, # multiplier applied to late prediction errors (ŷ > y)
-    learn_likelihood_noise=True,
-    init_likelihood_noise=0.01,
+    lambda_asymm=2.0,     # weight for PHM08 asymmetric loss
     label_noise_std=0.0,
     beta_kl=0.1,  
     seed: int | None = None,
@@ -110,21 +108,26 @@ def train_dkl_autoencoder(
     model = DKLAutoencoderSVGP(feature_extractor, inducing_points, latent_dim)
     # FIX: Gabbia Matematica per l'Incertezza (Varianza)
     # Impediamo all'ottimizzatore di far esplodere il rumore verso l'infinito.
-    # Obblighiamo il modello a calibrare l'incertezza vera basandosi sui dati.
-    noise_constraint = gpytorch.constraints.Interval(1e-4, 2.0)
-    likelihood = GaussianLikelihood(noise_constraint=noise_constraint)
     
-    # Initialize observation noise variance to a reasonable value; allow learning if enabled.
-    try:
-        likelihood.noise = torch.tensor(float(init_likelihood_noise))
-    except Exception:
-        pass
-    
-    # Optionally allow the observation noise to be learned
-    if not learn_likelihood_noise:
-        for p in likelihood.parameters():
-            p.requires_grad = False
-    
+    likelihood = GaussianLikelihood()
+    likelihood.noise = torch.tensor(0.1)   # ~std 7 cicli in spazio z → ~290 cicli² originale
+    for p in likelihood.parameters():
+        p.requires_grad = False            # noise fisso, non appreso
+
+
+    # Deriva rul_scale automaticamente dal dataset del loader
+    # (= std dei target RUL in spazio originale, usato per PHM08)
+    _dataset = getattr(train_loader, "dataset", None)
+    _tt = getattr(_dataset, "target_transform", None) if _dataset is not None else None
+    _scaler = getattr(_tt, "scaler", None) if _tt is not None else None
+    if _scaler is not None and hasattr(_scaler, "scale_"):
+        rul_scale = float(_scaler.scale_[0])
+    else:
+        rul_scale = 1.0
+        print("[WARNING] rul_scale non derivabile dal loader — PHM08 opera in spazio z.")
+    print(f"Likelihood noise (fisso): {likelihood.noise.item():.4f}")
+    print(f"RUL scale derivato dal dataset: {rul_scale:.4f}")
+
     model.train()
     likelihood.train()
 
@@ -138,18 +141,26 @@ def train_dkl_autoencoder(
     if gp_lr is None:
         gp_lr = 5e-3
 
+    # Adam per encoder, decoder, kernel hyperparams
     optimizer = torch.optim.Adam([
-        {'params': feature_extractor.encoder.parameters(), 'lr': encoder_lr, 'weight_decay': weight_decay},
-        {'params': feature_extractor.decoder.parameters(), 'lr': decoder_lr, 'weight_decay': weight_decay},
-        {'params': model.gp_layer.parameters(), 'lr': gp_lr},
-        {'params': likelihood.parameters(), 'lr': gp_lr * 0.1},
+        {'params': feature_extractor.encoder.parameters(), 'lr': encoder_lr},
+        {'params': feature_extractor.decoder.parameters(), 'lr': decoder_lr},
+        {'params': model.gp_layer.hyperparameters(), 'lr': gp_lr},
     ])
+
+
+    # NGD per i soli parametri variazionali q(u) — aggiornamento Bayesiano
+    ngd_optimizer = NGD(
+        model.gp_layer.variational_parameters(),
+        num_data=len(train_loader.dataset),
+        lr=0.1,
+    )
 
     mll = gpytorch.mlls.VariationalELBO(
         likelihood,
         model.gp_layer,
         num_data=len(train_loader.dataset),
-        beta=beta_kl,           # ← beta < 1 riduce il peso del KL, allarga la varianza posteriore
+        beta=beta_kl,
     )
     
     print(f"--- Starting DKL Autoencoder SVGP Training ({epochs} Epochs) ---")
@@ -181,38 +192,41 @@ def train_dkl_autoencoder(
                 t = t.to(device)
                 
             optimizer.zero_grad()
+            ngd_optimizer.zero_grad()
 
             with gpytorch.settings.cholesky_jitter(1e-4):
-                # FIXED: Pass normalized_cycle to forward()
                 output = model(x, normalized_cycle=t)
                 variational_elbo = mll(output, y_noisy.squeeze(-1))
-                
-                # FIXED: Pass normalized_cycle to reconstruct()
+
                 x_reconstructed = feature_extractor.reconstruct(x, normalized_cycle=t)
                 loss_recon = F.mse_loss(x_reconstructed, x)
-                
 
-                # PHM asymmetric penalty: late predictions (mean > true RUL)
-                # are penalized more heavily than early ones, aligning training
-                # with the C-MAPSS evaluation metric.
-                pred_errors = output.mean - y_noisy.squeeze(-1)
-                asym_weights = torch.where(
-                    pred_errors > 0,
-                    torch.full_like(pred_errors, float(asymm_late_penalty)),
-                    torch.ones_like(pred_errors),
-                )
-                loss_asymm = (asym_weights * pred_errors.pow(2)).mean()
+                # pred_errors in cicli originali → PHM08 opera sulla scala corretta
+                pred_errors = (output.mean - y_noisy.squeeze(-1)) * float(rul_scale)
+                # PHM08 asymmetric loss: minimo naturale a d ≈ -3 cicli (early)
+                # early (d<0): exp(-d/13)-1  → cresce lentamente
+                # late  (d>0): exp( d/10)-1  → cresce più velocemente
+                loss_asymm = torch.where(
+                    pred_errors < 0,
+                    torch.exp(torch.clamp(-pred_errors / 13.0, max=10.0)) - 1.0,
+                    torch.exp(torch.clamp( pred_errors / 10.0, max=10.0)) - 1.0,
+                ).mean()
 
-                total_loss = (
-                    (-1.0 * variational_elbo)
-                    + (lambda_recon * loss_recon)
-                    + (lambda_asymm * loss_asymm)
-                )
+            elbo_loss = -variational_elbo
 
-            total_loss.backward()
+            # STEP 1: NGD + likelihood ricevono il gradiente dell'ELBO puro.
+            # retain_graph=True perche' il grafo serve ancora per total_loss.
+            elbo_loss.backward(retain_graph=True)
+            ngd_optimizer.step()
+
+            # STEP 2: Adam aggiorna encoder/decoder/kernel su recon + asymm SOLTANTO
+            # elbo_loss è già stato usato al STEP 1 — non ricalcolarlo qui
+            optimizer.zero_grad()
+            aux_loss = lambda_recon * loss_recon + lambda_asymm * loss_asymm
+            aux_loss.backward()
             optimizer.step()
-            
-            epoch_mll_loss += float((-1.0 * variational_elbo).item())
+
+            epoch_mll_loss   += float(elbo_loss.item())
             epoch_recon_loss += loss_recon.item()
             epoch_asymm_loss += loss_asymm.item()
             
@@ -220,6 +234,7 @@ def train_dkl_autoencoder(
             f"Epoch {epoch+1:02d} | ELBO Loss: {epoch_mll_loss/len(train_loader):.4f}"
             f" | Recon Loss: {epoch_recon_loss/len(train_loader):.4f}"
             f" | Asymm Loss: {epoch_asymm_loss/len(train_loader):.4f}"
+            f" | Noise: {likelihood.noise.item():.4f}"
         )
 
     final_report = evaluate_model_on_loader(model, train_loader, likelihood=likelihood)

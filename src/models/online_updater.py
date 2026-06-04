@@ -59,6 +59,8 @@ def simulate_online_stream_and_update(
     device: str = "cpu",
     collect_metrics: bool = False,
     rul_scale_factor: float = 1.0,
+    use_natural_gradient: bool = True,   # ← NUOVO: attiva il vero Bayesian online learning
+    ngd_lr: float = 0.1,                 # ← NUOVO: lr per NGD (separato da Adam)
 ):
     """
     Simulates a real-time sensor stream from C-MAPSS data, updating the model 
@@ -67,77 +69,67 @@ def simulate_online_stream_and_update(
     Dynamically supports both standard SVGP and DKLAutoencoderSVGP architectures.
     """
     is_dkl = isinstance(model, DKLAutoencoderSVGP)
+    target_gp = model.gp_layer if is_dkl else model
+
+    dataset = getattr(stream_loader, 'dataset', None)
+    num_data_total = len(dataset) if dataset is not None else 10_000
+    target_inverse = getattr(dataset, 'inverse_transform', None) if dataset is not None else None
     
     print(f"=== Starting Online Bayesian Updating Simulation ===")
     print(f"Detected Model Type: {'Deep Kernel Learning (DKL) SVGP' if is_dkl else 'Standard SVGP'}")
     print(f"Updating variational parameters every {update_every_x_cycles} cycles.\n")
     
-    model.to(device)
-    likelihood.to(device)
+    
+    # ------------------------------------------------------------------ #
+    # Setup optimizer NGD (una volta sola, fuori dal loop)               #
+    # ------------------------------------------------------------------ #
+    if use_natural_gradient:
+        from gpytorch.optim import NGD
+        ngd_optimizer = NGD(
+            target_gp.variational_parameters(),
+            num_data=num_data_total,
+            lr=ngd_lr,
+        )
+        mll = gpytorch.mlls.VariationalELBO(
+            likelihood, target_gp, num_data=num_data_total
+        )
 
-    target_inverse = None
-    dataset = getattr(stream_loader, 'dataset', None)
-    if dataset is not None:
-        target_inverse = getattr(dataset, 'inverse_transform', None)
-    
-    # Storage buffers for streaming window data
-    collected_x = []
-    collected_y = []
-    collected_t = []
-    cycle_counter = 0
-    global_cycles = 0
-    
     model.eval()
     likelihood.eval()
 
     for batch_idx, batch in enumerate(stream_loader):
-        # Unpack loader stream data
+        # --- unpack batch (invariato) ---
         if len(batch) == 4:
-            x_step, y_step, _, t_step = batch
+            x_step, y_step, unit_step, t_step = batch
         elif len(batch) == 3:
-            x_step, y_step, _ = batch
+            x_step, y_step, unit_step = batch
             t_step = None
         else:
             x_step, y_step = batch
             t_step = None
-            
+
         x_step = x_step.to(device)
         y_step = y_step.to(device)
         if t_step is not None:
             t_step = t_step.to(device)
-        
-        # 1. STREAMING PREDICTION & UNCERTAINTY TRACKING (Debugging Goal)
-        with torch.no_grad(), gpytorch.settings.fast_pred_var():
-            if hasattr(model, 'predict_with_uncertainty'):
-                prediction = model.predict_with_uncertainty(x_step, normalized_cycle=t_step, likelihood=likelihood)
-                pred_mean = prediction['mean'].detach().cpu().numpy()
-                pred_variance = prediction['variance'].detach().cpu().numpy()
-                lower_bound = prediction['lower'].detach().cpu().numpy()
-                upper_bound = prediction['upper'].detach().cpu().numpy()
-            else:
-                posterior_dist = model(x_step)
-                predictive_dist = likelihood(posterior_dist)
-                pred_mean = predictive_dist.mean.detach().cpu().numpy()
-                pred_variance = predictive_dist.variance.detach().cpu().numpy()
-                pred_std = np.sqrt(np.maximum(pred_variance, 1e-12))
-                lower_bound = pred_mean - (1.96 * pred_std)
-                upper_bound = pred_mean + (1.96 * pred_std)
 
-            true_val = y_step.detach().cpu().numpy().flatten()
+        # ------------------------------------------------------------------ #
+        # 1. PREDIZIONE (invariata)                                           #
+        # ------------------------------------------------------------------ #
+        with torch.no_grad():
+            prediction   = model.predict_with_uncertainty(x_step, normalized_cycle=t_step, likelihood=likelihood)
+            pred_mean     = prediction['mean'].cpu().numpy()
+            pred_variance = prediction['variance'].cpu().numpy()
+            lower_bound   = prediction['lower'].cpu().numpy()
+            upper_bound   = prediction['upper'].cpu().numpy()
+            true_val      = y_step.cpu().numpy().flatten()
 
             if callable(target_inverse):
                 pred_mean, pred_variance = target_inverse(pred_mean.flatten(), variance=pred_variance.flatten())
-                true_val = target_inverse(true_val)
+                true_val    = target_inverse(true_val)
                 lower_bound = target_inverse(lower_bound.flatten())
                 upper_bound = target_inverse(upper_bound.flatten())
-            elif rul_scale_factor != 1.0:
-                pred_mean = pred_mean * rul_scale_factor
-                pred_variance = pred_variance * (rul_scale_factor ** 2)
-                pred_std = np.sqrt(np.maximum(pred_variance, 1e-12))
-                lower_bound = pred_mean - (1.96 * pred_std)
-                upper_bound = pred_mean + (1.96 * pred_std)
-            covered = (true_val >= lower_bound) & (true_val <= upper_bound)
-            picp_step = np.mean(covered)
+
 
         # Optionally collect per-sample predictions for later metric aggregation
         if collect_metrics:
@@ -154,84 +146,40 @@ def simulate_online_stream_and_update(
             metrics_lowers.extend(np.atleast_1d(lower_bound).flatten().tolist())
             metrics_uppers.extend(np.atleast_1d(upper_bound).flatten().tolist())
 
-        # Log telemetry details to monitor interval tracking over time
-        if global_cycles % update_every_x_cycles == 0:
-            print(f"[Cycle {global_cycles:03d}] Mean Predicted RUL: {pred_mean.mean():.2f} | Avg Variance (σ²): {pred_variance.mean():.4f} | Window PICP: {picp_step*100:.1f}%")
-
-        # Accumulate data for the upcoming streaming fine-tuning optimization step
-        collected_x.append(x_step)
-        collected_y.append(y_step)
-        collected_t.append(t_step)
-        batch_size_now = len(x_step)
-        cycle_counter += batch_size_now
-        global_cycles += batch_size_now
-        
-        # 2. ONLINE BAYESIAN VARIATIONAL UPDATE (Streaming Fine-Tuning)
-
-        # 2. ONLINE BAYESIAN VARIATIONAL UPDATE (Streaming Fine-Tuning)
-        if cycle_counter >= update_every_x_cycles and fine_tune_epochs > 0:
-            X_update = torch.cat(collected_x, dim=0)
-            y_update = torch.cat(collected_y, dim=0)
-            T_update = torch.cat(collected_t, dim=0) if collected_t[0] is not None else None
-
+        # ------------------------------------------------------------------ #
+        # 2. AGGIORNAMENTO — qui entra il NGD                                 #
+        # ------------------------------------------------------------------ #
+        if use_natural_gradient:
+            # Congela tutto tranne i parametri variazionali
+            # (encoder, decoder, kernel restano fissi durante lo streaming)
             model.train()
-            likelihood.eval()  # Congeliamo il rumore di fondo
-
-            # --- FIX DEFINITIVO: CONGELAMENTO GLOBALE ---
-            # Blocchiamo tutti i gradienti del modello per evitare il collasso dimensionale
-            for param in model.parameters():
-                param.requires_grad_(False)
-            
-            variational_params = []
-            target_gp = model.gp_layer if is_dkl else model
-            
-            # Sblocchiamo SOLO la media variazionale del Processo Gaussiano.
-            # La matrice di covarianza (incertezza) rimarrà intatta.
-            for name, param in target_gp.named_parameters():
-                if "variational_mean" in name:
-                    param.requires_grad_(True)
-                    variational_params.append(param)
-            
-            # Ottimizziamo solo il vettore della media
-            online_optimizer = torch.optim.Adam(variational_params, lr=0.01)
-            
             if is_dkl:
-                model.encoder.eval() 
-                
-            # FIX: num_data DEVE essere la dimensione approssimativa del dataset globale (es. 50000).
-            # Evita il Catastrophic Forgetting.
-            mll = gpytorch.mlls.VariationalELBO(likelihood, target_gp, num_data=50000)
+                model.encoder.eval()
+                model.decoder.eval()
+                # Congela kernel — vuoi solo aggiornare q(u)
+                for p in target_gp.covar_module.parameters():
+                    p.requires_grad_(False)
 
-            # Eseguiamo i loop di fine-tuning
-            for ft_epoch in range(fine_tune_epochs):
-                online_optimizer.zero_grad()
-                
-                with gpytorch.settings.cholesky_jitter(1e-3):
-                    if is_dkl:
-                        output = model(X_update, normalized_cycle=T_update)
-                    else:
-                        output = model(X_update)
-                        
-                    loss_mll = -mll(output, y_update.squeeze(-1))
-                    loss_mll.backward()
-                    online_optimizer.step()
-                    
-            # Ripristiniamo i gradienti alla normalità una volta finito il micro-update
-            for param in model.parameters():
-                param.requires_grad_(True)
-                
-            # Reset back to operational evaluation mode
+            ngd_optimizer.zero_grad()
+
+            with gpytorch.settings.cholesky_jitter(1e-3):
+                output = (
+                    model(x_step, normalized_cycle=t_step) if is_dkl
+                    else model(x_step)
+                )
+                loss = -mll(output, y_step.squeeze(-1))
+
+            loss.backward()
+            ngd_optimizer.step()   # ← aggiornamento Bayesiano in forma chiusa
+
+            # Ripristina kernel
+            for p in target_gp.covar_module.parameters():
+                p.requires_grad_(True)
+
             model.eval()
             likelihood.eval()
-            
-            # SLIDING WINDOW
-            # Manteniamo la memoria recente per il prossimo update
-            MAX_MEMORY = 50
-            collected_x = collected_x[-MAX_MEMORY:]
-            collected_y = collected_y[-MAX_MEMORY:]
-            collected_t = collected_t[-MAX_MEMORY:]
-            
-            cycle_counter = 0
+
+
 
     print("\n=== Online Bayesian Updating Simulation Completed Successfully ===")
     results = {'model': model, 'likelihood': likelihood}

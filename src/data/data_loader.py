@@ -22,17 +22,13 @@ def smooth_clip_rul(values: Union[np.ndarray, torch.Tensor], max_rul: float) -> 
     return max_rul - np.logaddexp(0.0, max_rul - values_array)
 
 
-def inverse_smooth_clip_rul(values: Union[np.ndarray, torch.Tensor], max_rul: float) -> Union[np.ndarray, torch.Tensor]:
-    """Invert the smooth clipping transform on values strictly below max_rul."""
+def inverse_smooth_clip_rul(values, max_rul):
     eps = 1e-8
-    if torch.is_tensor(values):
-        max_rul_tensor = torch.as_tensor(max_rul, dtype=values.dtype, device=values.device)
-        clipped = torch.clamp(values, max=max_rul_tensor - eps)
-        return max_rul_tensor - torch.log(torch.expm1(max_rul_tensor - clipped))
-
     values_array = np.asarray(values, dtype=np.float64)
     clipped = np.minimum(values_array, max_rul - eps)
-    return max_rul - np.log(np.expm1(max_rul - clipped))
+    arg = max_rul - clipped                        # → quasi 0 per valori vicini a max_rul
+    safe_arg = np.maximum(arg, 1e-7)               # ← clamp prima di expm1
+    return max_rul - np.log(np.expm1(safe_arg))
 
 
 @dataclass
@@ -66,51 +62,29 @@ class SmoothRULTargetTransform:
         transformed = self.scaler.transform(targets_array).reshape(-1)
         return transformed
 
-    def inverse_transform(
-        self,
-        values: Union[np.ndarray, torch.Tensor],
-        variance: Optional[Union[np.ndarray, torch.Tensor]] = None,
-    ):
-        if not self.fitted:
-            raise RuntimeError("SmoothRULTargetTransform must be fit before calling inverse_transform().")
-
-        safe_max = self.max_rul - self.CLAMP_MARGIN
-
-        if torch.is_tensor(values):
-            smooth_values = values * float(self.scaler.scale_[0]) + float(self.scaler.mean_[0])
-            smooth_values = torch.clamp(smooth_values, max=safe_max)
-            raw_values = inverse_smooth_clip_rul(smooth_values, self.max_rul)
-            if variance is None:
-                return raw_values
-
-            variance_tensor = (
-                variance if torch.is_tensor(variance)
-                else torch.as_tensor(variance, dtype=values.dtype, device=values.device)
-            )
-            derivative = self._inverse_derivative_torch(smooth_values)
-            raw_variance = variance_tensor * (derivative ** 2)
-            return raw_values, raw_variance
-
+    def inverse_transform(self, values, variance=None):
         values_array = np.asarray(values, dtype=np.float64).reshape(-1)
         smooth_values = values_array * float(self.scaler.scale_[0]) + float(self.scaler.mean_[0])
-        smooth_values = np.clip(smooth_values, -np.inf, safe_max)
-        raw_values = inverse_smooth_clip_rul(smooth_values, self.max_rul)
+        
+        # Clampa SOLO per il calcolo del valore, non per la derivata
+        smooth_values_clamped = np.clip(smooth_values, -np.inf, self.max_rul - self.CLAMP_MARGIN)
+        raw_values = inverse_smooth_clip_rul(smooth_values_clamped, self.max_rul)
+        
         if variance is None:
             return raw_values
 
         variance_array = np.asarray(variance, dtype=np.float64).reshape(-1)
+        # Derivata calcolata su smooth_values NON clampato per preservare la varianza
         derivative = self._inverse_derivative_numpy(smooth_values)
         raw_variance = variance_array * (derivative ** 2)
-
         return raw_values, raw_variance
 
-    def inverse_interval(
-        self,
-        lower: Union[np.ndarray, torch.Tensor],
-        upper: Union[np.ndarray, torch.Tensor],
-    ) -> Tuple[Union[np.ndarray, torch.Tensor], Union[np.ndarray, torch.Tensor]]:
+    def inverse_interval(self, lower, upper):
+        # Applica inverse_transform indipendentemente su lower e upper
+        # SENZA clampare lower allo stesso valore di upper
         lower_raw = self.inverse_transform(lower)
         upper_raw = self.inverse_transform(upper)
+        # Se upper è saturato al max, almeno lower può essere più basso
         return lower_raw, upper_raw
 
     def _inverse_derivative_numpy(self, smooth_values: np.ndarray) -> np.ndarray:
