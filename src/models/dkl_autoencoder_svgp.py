@@ -17,7 +17,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
-from src.models.kernels import DegradationKernel
+from src.models.kernels import DegradationKernel, SpaceTimeKernel
 
 
 class Encoder(nn.Module):
@@ -82,9 +82,20 @@ class AutoencoderFeatureExtractor(nn.Module):
 
 
 class LatentSpaceSVGP(ApproximateGP):
-    """Variational GP operating directly in the latent manifold."""
+    """Variational GP operating in the augmented space (latent embedding ‖ time).
+
+    Input layout expected by this GP:
+        x[..., :latent_dim]  →  z  (encoder output, scaled to [-1, 1])
+        x[..., latent_dim:]  →  t  (normalised cycle, scalar in [0, 1])
+
+    The inducing points must therefore have shape (M, latent_dim + 1).
+    SpaceTimeKernel factorises the covariance as k_space(z,z') * k_time(t,t'),
+    so the GP can distinguish engines with similar sensor profiles but at
+    different life stages — the key information missing from a purely spatial GP.
+    """
 
     def __init__(self, inducing_points: torch.Tensor, latent_dim: int):
+        # inducing_points: (M, latent_dim + 1)  — already augmented with t
         variational_distribution = NaturalVariationalDistribution(inducing_points.size(0))
         variational_strategy = VariationalStrategy(
             self,
@@ -95,7 +106,9 @@ class LatentSpaceSVGP(ApproximateGP):
         super().__init__(variational_strategy)
 
         self.mean_module = ConstantMean()
-        self.covar_module = DegradationKernel(num_dimensions=latent_dim)
+        # SpaceTimeKernel splits the input internally; it only needs latent_dim
+        # to know where the z/t boundary lies.
+        self.covar_module = SpaceTimeKernel(latent_dim=latent_dim)
 
     def forward(self, latent_x: torch.Tensor):
         mean_x = self.mean_module(latent_x)
@@ -123,10 +136,24 @@ class DKLAutoencoderSVGP(nn.Module):
         self.gp_layer = LatentSpaceSVGP(inducing_points=inducing_points, latent_dim=self.latent_dim)
 
     def encode(self, x: torch.Tensor, normalized_cycle: torch.Tensor | None = None) -> torch.Tensor:
+        """Return the augmented GP input: [z_scaled ‖ t].
+
+        The GP kernel (SpaceTimeKernel) expects the last dimension to be laid
+        out as [z_0, …, z_{D-1}, t] so it can slice at self.latent_dim.
+
+        If normalized_cycle is None (e.g. during inference without time info)
+        we fall back to a zero time column, which keeps the call signature
+        backward-compatible but removes temporal information.
+        """
         latent = self.encoder(x, normalized_cycle)
-        # Usa ScaleToBounds invece di tanh: mappa linearmente nell'intervallo [-1, 1]
-        # senza saturare i gradienti né comprimere le distanze nel latent space
-        return self.scale_to_bounds(latent)  # ← sostituisce torch.tanh(latent)
+        z_scaled = self.scale_to_bounds(latent)   # maps z to [-1, 1]
+
+        if normalized_cycle is not None:
+            t = normalized_cycle.view(-1, 1)       # (B, 1)  already in [0, 1]
+        else:
+            t = torch.zeros(x.size(0), 1, dtype=x.dtype, device=x.device)
+
+        return torch.cat([z_scaled, t], dim=-1)    # (B, latent_dim + 1)
 
 
     def reconstruct(self, x: torch.Tensor, normalized_cycle: torch.Tensor | None = None) -> torch.Tensor:

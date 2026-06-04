@@ -22,17 +22,37 @@ def set_reproducible_seed(seed: int) -> None:
         pass
 
 def _collect_latent_embeddings(feature_extractor, train_loader, device):
+    """Collect augmented GP inputs (z ‖ t) from the encoder.
+
+    The returned tensor has shape (N, latent_dim + 1): the last column is the
+    normalised cycle so that K-Means seeds inducing points in the same
+    augmented space that SpaceTimeKernel and LatentSpaceSVGP will use.
+    Seeding in the wrong space (z only) would place inducing points off the
+    true data manifold and prevent the GP from converging.
+    """
     feature_extractor.eval()
     latents = []
     with torch.no_grad():
         for batch in train_loader:
             x = batch[0].to(device)
-            # FIXED: Catch time element
             t = batch[3].to(device) if len(batch) == 4 else None
-            
-            # FIXED: Pass normalized_cycle
-            latents.append(feature_extractor.encoder(x, normalized_cycle=t).detach().cpu())
-            
+
+            # encode() now returns (z_scaled ‖ t), shape (B, latent_dim + 1)
+            z_scaled = feature_extractor.encoder(x, normalized_cycle=t).detach()
+            from gpytorch.utils.grid import ScaleToBounds
+            # Re-use the same ScaleToBounds already on the model if available,
+            # otherwise apply it locally — result is identical.
+            stb = getattr(feature_extractor, 'scale_to_bounds', ScaleToBounds(-1.0, 1.0))
+            z_scaled = stb(z_scaled)
+
+            if t is not None:
+                t_col = t.view(-1, 1)
+            else:
+                t_col = torch.zeros(x.size(0), 1, dtype=x.dtype, device=x.device)
+
+            augmented = torch.cat([z_scaled, t_col], dim=-1).cpu()
+            latents.append(augmented)
+
     feature_extractor.train()
     if not latents:
         raise ValueError('Unable to collect latent embeddings from an empty training loader.')
@@ -153,7 +173,10 @@ def train_dkl_autoencoder(
         inducing_points = torch.cat([inducing_points, inducing_points[repeat_idx]], dim=0)
 
     # 3. Setup del Modello e Likelihood
-    model = DKLAutoencoderSVGP(feature_extractor, inducing_points, latent_dim)
+    # latent_dim + 1: the GP input is the augmented vector [z (latent_dim) | t (1)].
+    # DKLAutoencoderSVGP stores this as self.latent_dim and forwards it to
+    # LatentSpaceSVGP → SpaceTimeKernel so the kernel knows where to split.
+    model = DKLAutoencoderSVGP(feature_extractor, inducing_points, latent_dim + 1)
 
     # Deriva rul_scale automaticamente dal dataset del loader
     # (= std dei target RUL in spazio originale, usato per PHM08 e per calibrare il noise)
