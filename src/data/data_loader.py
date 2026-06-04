@@ -62,22 +62,48 @@ class SmoothRULTargetTransform:
         transformed = self.scaler.transform(targets_array).reshape(-1)
         return transformed
 
-    def inverse_transform(self, values, variance=None):
+    def inverse_transform(
+        self,
+        values: Union[np.ndarray, torch.Tensor],
+        variance: Optional[Union[np.ndarray, torch.Tensor]] = None,
+        is_upper_bound: bool = False,
+    ):
+        if not self.fitted:
+            raise RuntimeError("SmoothRULTargetTransform must be fit before calling inverse_transform().")
+
+        # Per gli upper bound degli intervalli di confidenza usiamo un margine
+        # molto più piccolo (0.1 cicli) così il cap non tronca artificialmente
+        # la copertura superiore. Per media e lower bound usiamo CLAMP_MARGIN=2.0
+        # che mantiene la stabilità numerica della derivata.
+        safe_max = self.max_rul - (0.1 if is_upper_bound else self.CLAMP_MARGIN)
+
+        if torch.is_tensor(values):
+            smooth_values = values * float(self.scaler.scale_[0]) + float(self.scaler.mean_[0])
+            smooth_values = torch.clamp(smooth_values, max=safe_max)
+            raw_values = inverse_smooth_clip_rul(smooth_values, self.max_rul)
+            if variance is None:
+                return raw_values
+            variance_tensor = (
+                variance if torch.is_tensor(variance)
+                else torch.as_tensor(variance, dtype=values.dtype, device=values.device)
+            )
+            derivative = self._inverse_derivative_torch(smooth_values)
+            raw_variance = variance_tensor * (derivative ** 2)
+            return raw_values, raw_variance
+
         values_array = np.asarray(values, dtype=np.float64).reshape(-1)
         smooth_values = values_array * float(self.scaler.scale_[0]) + float(self.scaler.mean_[0])
-        
-        # Clampa SOLO per il calcolo del valore, non per la derivata
-        smooth_values_clamped = np.clip(smooth_values, -np.inf, self.max_rul - self.CLAMP_MARGIN)
-        raw_values = inverse_smooth_clip_rul(smooth_values_clamped, self.max_rul)
-        
+        smooth_values = np.clip(smooth_values, -np.inf, safe_max)
+        raw_values = inverse_smooth_clip_rul(smooth_values, self.max_rul)
         if variance is None:
             return raw_values
 
         variance_array = np.asarray(variance, dtype=np.float64).reshape(-1)
-        # Derivata calcolata su smooth_values NON clampato per preservare la varianza
+        # Derivata consistente: valutata sugli stessi smooth_values già clampati
         derivative = self._inverse_derivative_numpy(smooth_values)
         raw_variance = variance_array * (derivative ** 2)
         return raw_values, raw_variance
+
 
     def inverse_interval(self, lower, upper):
         # Applica inverse_transform indipendentemente su lower e upper
@@ -227,5 +253,5 @@ class StreamingCMAPSSDataset(Dataset):
         # Yield a 4-tuple: (features, target, unit, time)
         return self.X[idx], self.y[idx], self.unit_nrs[idx], self.time_cycles[idx]
 
-    def inverse_transform(self, values, variance: Optional[Union[np.ndarray, torch.Tensor]] = None):
-        return self.target_transform.inverse_transform(values, variance=variance)
+    def inverse_transform(self, values, variance=None, is_upper_bound=False):
+        return self.target_transform.inverse_transform(values, variance=variance, is_upper_bound=is_upper_bound)

@@ -38,6 +38,50 @@ def _collect_latent_embeddings(feature_extractor, train_loader, device):
         raise ValueError('Unable to collect latent embeddings from an empty training loader.')
     return torch.cat(latents, dim=0)
 
+def _interval_score_loss(
+    mean: torch.Tensor,
+    std: torch.Tensor,
+    y: torch.Tensor,
+    alpha: float = 0.05,
+    alpha_lo_scale: float = 0.5,
+) -> torch.Tensor:
+    """Asymmetric Interval Score (Gneiting & Raftery, 2007).
+
+    Jointly minimises interval width and miscoverage, with an asymmetric
+    penalty that makes the lower bound more conservative (wider downward
+    coverage) to bias predictions toward early RUL estimates and reduce
+    the C-MAPSS penalty.
+
+    IS = (upper - lower)
+         + (2/α_lo) * max(lower - y, 0)   ← heavy penalty for late preds
+         + (2/α_hi) * max(y - upper, 0)   ← lighter penalty for early preds
+
+    Args:
+        mean:          GP predictive mean  (batch,)
+        std:           GP predictive std   (batch,)
+        y:             targets             (batch,)
+        alpha:         total miscoverage budget (0.05 → 95% CI)
+        alpha_lo_scale: fraction of alpha assigned to the lower tail.
+                        < 0.5  → lower tail gets less budget → lower bound
+                        is pushed further down → more conservative toward
+                        early predictions.  Default 0.5 = symmetric.
+                        Use ~0.2 to strongly bias toward early predictions.
+    """
+    alpha_lo = alpha * alpha_lo_scale          # e.g. 0.05 * 0.2 = 0.010
+    alpha_hi = alpha * (1.0 - alpha_lo_scale)  # e.g. 0.05 * 0.8 = 0.040
+
+    from torch.distributions import Normal
+    dist = Normal(mean, std.clamp(min=1e-6))
+    lower = dist.icdf(torch.tensor(alpha_lo / 2.0, device=mean.device))
+    upper = dist.icdf(torch.tensor(1.0 - alpha_hi / 2.0, device=mean.device))
+
+    width    = (upper - lower).mean()
+    miss_lo  = F.relu(lower - y).mean() * (2.0 / alpha_lo)   # y below lower → late pred
+    miss_hi  = F.relu(y - upper).mean() * (2.0 / alpha_hi)   # y above upper → early pred
+
+    return width + miss_lo + miss_hi
+
+
 def train_dkl_autoencoder(
     train_loader,
     input_dim,
@@ -49,10 +93,14 @@ def train_dkl_autoencoder(
     decoder_lr=None,
     gp_lr=None,
     weight_decay=1e-5,
-    lambda_recon=1.0,       # raised from 0.1 — forces a structured latent space
-    lambda_asymm=2.0,     # weight for PHM08 asymmetric loss
+    lambda_recon=1.0,            # forces a structured latent space
+    lambda_asymm=0.5,            # lowered: asymm loss can explode — keep it gentle
+    lambda_interval=1.0,         # weight for asymmetric interval score loss
+    interval_alpha: float = 0.05,          # target miscoverage (0.05 → 95% CI)
+    interval_alpha_lo_scale: float = 0.2,  # <0.5 → bias lower bound downward (early preds)
     label_noise_std=0.0,
-    beta_kl=0.1,  
+    beta_kl=0.5,                 # regularises GP variational distribution
+    grad_clip: float = 1.0,      # max gradient norm — prevents asymm loss explosions
     seed: int | None = None,
 ):
     from src.models.dkl_autoencoder_svgp import AutoencoderFeatureExtractor, DKLAutoencoderSVGP
@@ -106,17 +154,9 @@ def train_dkl_autoencoder(
 
     # 3. Setup del Modello e Likelihood
     model = DKLAutoencoderSVGP(feature_extractor, inducing_points, latent_dim)
-    # FIX: Gabbia Matematica per l'Incertezza (Varianza)
-    # Impediamo all'ottimizzatore di far esplodere il rumore verso l'infinito.
-    
-    likelihood = GaussianLikelihood()
-    likelihood.noise = torch.tensor(0.1)   # ~std 7 cicli in spazio z → ~290 cicli² originale
-    for p in likelihood.parameters():
-        p.requires_grad = False            # noise fisso, non appreso
-
 
     # Deriva rul_scale automaticamente dal dataset del loader
-    # (= std dei target RUL in spazio originale, usato per PHM08)
+    # (= std dei target RUL in spazio originale, usato per PHM08 e per calibrare il noise)
     _dataset = getattr(train_loader, "dataset", None)
     _tt = getattr(_dataset, "target_transform", None) if _dataset is not None else None
     _scaler = getattr(_tt, "scaler", None) if _tt is not None else None
@@ -125,8 +165,24 @@ def train_dkl_autoencoder(
     else:
         rul_scale = 1.0
         print("[WARNING] rul_scale non derivabile dal loader — PHM08 opera in spazio z.")
-    print(f"Likelihood noise (fisso): {likelihood.noise.item():.4f}")
+
+    # Noise auto-calibrato dal dataset: target_noise_std_cycles è l'unico
+    # iperparametro interpretabile (std aleatoria in cicli fisici), poi viene
+    # convertito in spazio z dividendo per rul_scale.
+    # Questo garantisce lo stesso significato fisico su tutti i dataset
+    # (FD001/FD002/FD003/FD004) indipendentemente dalla scala del target.
+    _target_noise_std_cycles = 10.0          # ~10 cicli std aleatoria: ragionevole per CMAPSS
+    _noise_z = (_target_noise_std_cycles / rul_scale) ** 2
+
+    likelihood = GaussianLikelihood(
+        noise_constraint=gpytorch.constraints.Positive()
+    )
+    likelihood.noise = torch.tensor(_noise_z)
+    for p in likelihood.parameters():
+        p.requires_grad = False              # noise fisso, non appreso
+
     print(f"RUL scale derivato dal dataset: {rul_scale:.4f}")
+    print(f"Likelihood noise auto-calibrato: {_noise_z:.4f}  (={_target_noise_std_cycles:.1f} cicli std in spazio fisico)")
 
     model.train()
     likelihood.train()
@@ -165,10 +221,11 @@ def train_dkl_autoencoder(
     
     print(f"--- Starting DKL Autoencoder SVGP Training ({epochs} Epochs) ---")
     for epoch in range(epochs):
-        epoch_mll_loss = 0.0
-        epoch_recon_loss = 0.0
-        epoch_asymm_loss = 0.0
-        
+        epoch_mll_loss      = 0.0
+        epoch_recon_loss    = 0.0
+        epoch_asymm_loss    = 0.0
+        epoch_interval_loss = 0.0
+
         for batch in train_loader:
             # FIXED: Unpack 4-tuple safely
             if len(batch) == 4:
@@ -185,12 +242,12 @@ def train_dkl_autoencoder(
                 y_noisy = y + (torch.randn_like(y) * float(label_noise_std))
             else:
                 y_noisy = y
-                
-            x = x.to(device)
+
+            x       = x.to(device)
             y_noisy = y_noisy.to(device)
             if t is not None:
                 t = t.to(device)
-                
+
             optimizer.zero_grad()
             ngd_optimizer.zero_grad()
 
@@ -201,39 +258,65 @@ def train_dkl_autoencoder(
                 x_reconstructed = feature_extractor.reconstruct(x, normalized_cycle=t)
                 loss_recon = F.mse_loss(x_reconstructed, x)
 
-                # pred_errors in cicli originali → PHM08 opera sulla scala corretta
+                # PHM08 asymmetric loss in spazio fisico (cicli originali)
                 pred_errors = (output.mean - y_noisy.squeeze(-1)) * float(rul_scale)
-                # PHM08 asymmetric loss: minimo naturale a d ≈ -3 cicli (early)
-                # early (d<0): exp(-d/13)-1  → cresce lentamente
-                # late  (d>0): exp( d/10)-1  → cresce più velocemente
                 loss_asymm = torch.where(
                     pred_errors < 0,
                     torch.exp(torch.clamp(-pred_errors / 13.0, max=10.0)) - 1.0,
                     torch.exp(torch.clamp( pred_errors / 10.0, max=10.0)) - 1.0,
                 ).mean()
 
+                # Asymmetric Interval Score — ottimizza direttamente PICP e
+                # larghezza degli intervalli con bias verso early predictions.
+                # Viene calcolata in spazio z (stessa scala dell'output del GP)
+                # per compatibilità con i gradienti dell'ELBO.
+                pred_std = output.variance.clamp(min=1e-6).sqrt()
+                loss_interval = _interval_score_loss(
+                    mean=output.mean,
+                    std=pred_std,
+                    y=y_noisy.squeeze(-1),
+                    alpha=interval_alpha,
+                    alpha_lo_scale=interval_alpha_lo_scale,
+                )
+
             elbo_loss = -variational_elbo
 
-            # STEP 1: NGD + likelihood ricevono il gradiente dell'ELBO puro.
-            # retain_graph=True perche' il grafo serve ancora per total_loss.
+            # STEP 1: NGD riceve il gradiente dell'ELBO puro (parametri variazionali).
+            # retain_graph=True perché il grafo serve ancora per aux_loss.
             elbo_loss.backward(retain_graph=True)
             ngd_optimizer.step()
 
-            # STEP 2: Adam aggiorna encoder/decoder/kernel su recon + asymm SOLTANTO
-            # elbo_loss è già stato usato al STEP 1 — non ricalcolarlo qui
+            # STEP 2: Adam aggiorna encoder/decoder/kernel hyperparams su:
+            #   - recon:    mantiene latent space strutturato
+            #   - asymm:    guida le predizioni medie verso early
+            #   - interval: calibra larghezza e copertura degli intervalli
             optimizer.zero_grad()
-            aux_loss = lambda_recon * loss_recon + lambda_asymm * loss_asymm
+            aux_loss = (
+                lambda_recon      * loss_recon
+                + lambda_asymm    * loss_asymm
+                + lambda_interval * loss_interval
+            )
             aux_loss.backward()
+            # Gradient clipping: impedisce che l'asymm loss esploda su batch
+            # con errori grandi (es. engine in fase di saturazione RUL).
+            torch.nn.utils.clip_grad_norm_(
+                [p for group in optimizer.param_groups for p in group["params"]],
+                max_norm=grad_clip,
+            )
             optimizer.step()
 
-            epoch_mll_loss   += float(elbo_loss.item())
-            epoch_recon_loss += loss_recon.item()
-            epoch_asymm_loss += loss_asymm.item()
-            
+            epoch_mll_loss      += float(elbo_loss.item())
+            epoch_recon_loss    += loss_recon.item()
+            epoch_asymm_loss    += loss_asymm.item()
+            epoch_interval_loss += loss_interval.item()
+
+        n = len(train_loader)
         print(
-            f"Epoch {epoch+1:02d} | ELBO Loss: {epoch_mll_loss/len(train_loader):.4f}"
-            f" | Recon Loss: {epoch_recon_loss/len(train_loader):.4f}"
-            f" | Asymm Loss: {epoch_asymm_loss/len(train_loader):.4f}"
+            f"Epoch {epoch+1:02d}"
+            f" | ELBO: {epoch_mll_loss/n:.4f}"
+            f" | Recon: {epoch_recon_loss/n:.4f}"
+            f" | Asymm: {epoch_asymm_loss/n:.4f}"
+            f" | Interval: {epoch_interval_loss/n:.4f}"
             f" | Noise: {likelihood.noise.item():.4f}"
         )
 
