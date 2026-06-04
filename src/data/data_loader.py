@@ -3,9 +3,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
-from sklearn.preprocessing import StandardScaler
 from dataclasses import dataclass, field
 from typing import Tuple, List, Optional, Union
+from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 
 
@@ -255,3 +255,59 @@ class StreamingCMAPSSDataset(Dataset):
 
     def inverse_transform(self, values, variance=None, is_upper_bound=False):
         return self.target_transform.inverse_transform(values, variance=variance, is_upper_bound=is_upper_bound)
+    
+class RegimeConditionedScaler:
+    """
+    Scaler specializzato per dataset multi-regime (FD002, FD004).
+    Applica KMeans alle colonne operative (setting_1, setting_2, setting_3) 
+    per identificare i 6 regimi. Scala le feature dei sensori in modo 
+    indipendente per ciascun regime, rimuovendo lo scalino causato dal 
+    cambio di altitudine/mach.
+    """
+    def __init__(self, n_regimes: int = 6, setting_cols_indices: tuple = (0, 1, 2)):
+        self.n_regimes = n_regimes
+        self.setting_cols_indices = setting_cols_indices
+        # n_init=10 garantisce la corretta convergenza sui 6 centroidi esatti
+        self.kmeans = KMeans(n_clusters=n_regimes, random_state=42, n_init=10)
+        self.scalers = {i: StandardScaler() for i in range(n_regimes)}
+        self.is_fitted = False
+
+    def fit(self, X: np.ndarray):
+        X_arr = np.asarray(X)
+        # Estrae solo i 3 settings operativi
+        settings = X_arr[:, self.setting_cols_indices]
+        
+        # Identifica a quale dei 6 regimi appartiene ogni ciclo
+        clusters = self.kmeans.fit_predict(settings)
+        
+        # Fitta uno StandardScaler indipendente per ogni regime
+        for i in range(self.n_regimes):
+            mask = (clusters == i)
+            if np.sum(mask) > 0:
+                self.scalers[i].fit(X_arr[mask])
+        
+        self.is_fitted = True
+        return self
+
+    def transform(self, X: np.ndarray) -> np.ndarray:
+        if not self.is_fitted:
+            raise RuntimeError("RegimeConditionedScaler must be fit before calling transform().")
+            
+        X_arr = np.asarray(X)
+        settings = X_arr[:, self.setting_cols_indices]
+        # Assegna i cicli di test ai regimi imparati in addestramento
+        clusters = self.kmeans.predict(settings)
+        
+        X_scaled = np.zeros_like(X_arr, dtype=np.float64)
+        
+        # Scala ogni ciclo con lo scaler del suo specifico regime
+        for i in range(self.n_regimes):
+            mask = (clusters == i)
+            if np.sum(mask) > 0:
+                X_scaled[mask] = self.scalers[i].transform(X_arr[mask])
+                
+        return X_scaled
+
+    def fit_transform(self, X: np.ndarray) -> np.ndarray:
+        self.fit(X)
+        return self.transform(X)
