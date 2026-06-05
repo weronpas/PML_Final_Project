@@ -1,9 +1,8 @@
 # Probabilistic Digital Twin for Predictive Maintenance
 **Course:** Probabilistic Machine Learning  
 
----
 
-## 📌 Executive Summary
+## Executive Summary
 This repository contains a **Probabilistic Digital Twin** for predicting the Remaining Useful Life (RUL) of aircraft turbofan engines (NASA C-MAPSS dataset). Standard predictive models output single-point estimates, which are dangerous in aviation. Our solution solves this by providing rigorous, Bayesian uncertainty quantification to establish strictly safe maintenance thresholds.
 
 
