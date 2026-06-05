@@ -1,44 +1,13 @@
-# Probabilistic Digital Twin for Rotating Machinery
+# Probabilistic Digital Twin for Predictive Maintenance
+**Course:** Probabilistic Machine Learning  
 
-## Project Overview
-This project is developed for the Probabilistic Machine Learning course. Our goal is to create a probabilistic "digital twin" for fault prediction in industrial rotating machinery (e.g., turbines). We aim to model the system's degradation using Variational Gaussian Processes.
+---
 
-## Dataset
-We are using the **NASA C-MAPSS** (Commercial Modular Aero-Propulsion System Simulation) dataset, which contains run-to-failure simulation data for turbofan engines.
+## 📌 Executive Summary
+This repository contains a **Probabilistic Digital Twin** for predicting the Remaining Useful Life (RUL) of aircraft turbofan engines (NASA C-MAPSS dataset). Standard predictive models output single-point estimates, which are dangerous in aviation. Our solution solves this by providing rigorous, Bayesian uncertainty quantification to establish strictly safe maintenance thresholds.
 
-## Technologies Used
-* **Python**
-* **PyTorch & GPyTorch** (for probabilistic modeling)
-* **Pandas, NumPy, Scikit-learn** (for data processing and evaluation)
 
-## Repository Structure
-```text
-pml-digital-twin/
-├── data/                   # Store data here
-│   ├── raw/                # Raw data downloaded directly from NASA
-│   └── processed/          # Data after cleaning and normalization
-├── notebooks/              
-│   ├── 01_eda.ipynb        # Exploratory Data Analysis
-│   └── 02_svgp_poc.ipynb   # Proof of Concept for the model
-├── src/                    # Project source code
-│   ├── __init__.py
-│   ├── data/               # Scripts for loading and processing data
-│   │   ├── __init__.py
-│   │   └── data_loader.py  
-│   ├── models/             # Model and kernel definitions
-│   │   ├── __init__.py
-│   │   ├── svgp.py         # Main model class
-│   │   └── kernels.py      # Physics-informed kernels
-│   ├── training/           # Training logic and loops
-│   │   ├── __init__.py
-│   │   └── trainer.py
-│   └── utils/              # Helper functions, metrics (NLL, PICP)
-│       ├── __init__.py
-│       └── metrics.py
-├── .gitignore              
-├── requirements.txt        
-└── README.md               
-```
+
 ## References
 * Saxena, A., Goebel, K., Simon, D., & Eklund, N. (2008). Damage Propagation Modeling for Aircraft Engine Run-to-Failure Simulation.
 * Zhang, Z. J., et al. (2024). Probabilistic Learning from Real-World Observations of Systems with Unknown Inputs for Model-Form UQ and Digital Twinning.
