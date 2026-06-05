@@ -73,17 +73,17 @@ def _interval_score_loss(
     the C-MAPSS penalty.
 
     IS = (upper - lower)
-         + (2/α_lo) * max(lower - y, 0)   ← heavy penalty for late preds
-         + (2/α_hi) * max(y - upper, 0)   ← lighter penalty for early preds
+         + (2/α_lo) * max(lower - y, 0)   # heavy penalty for late preds
+         + (2/α_hi) * max(y - upper, 0)   # lighter penalty for early preds
 
     Args:
         mean:          GP predictive mean  (batch,)
         std:           GP predictive std   (batch,)
         y:             targets             (batch,)
-        alpha:         total miscoverage budget (0.05 → 95% CI)
+        alpha:         total miscoverage budget (0.05 -> 95% CI)
         alpha_lo_scale: fraction of alpha assigned to the lower tail.
-                        < 0.5  → lower tail gets less budget → lower bound
-                        is pushed further down → more conservative toward
+                        < 0.5  -> lower tail gets less budget -> lower bound
+                        is pushed further down -> more conservative toward
                         early predictions.  Default 0.5 = symmetric.
                         Use ~0.2 to strongly bias toward early predictions.
     """
@@ -96,8 +96,8 @@ def _interval_score_loss(
     upper = dist.icdf(torch.tensor(1.0 - alpha_hi / 2.0, device=mean.device))
 
     width    = (upper - lower).mean()
-    miss_lo  = F.relu(lower - y).mean() * (2.0 / alpha_lo)   # y below lower → late pred
-    miss_hi  = F.relu(y - upper).mean() * (2.0 / alpha_hi)   # y above upper → early pred
+    miss_lo  = F.relu(lower - y).mean() * (2.0 / alpha_lo)   # y below lower -> late pred
+    miss_hi  = F.relu(y - upper).mean() * (2.0 / alpha_hi)   # y above upper -> early pred
 
     return width + miss_lo + miss_hi
 
@@ -116,8 +116,8 @@ def train_dkl_autoencoder(
     lambda_recon=1.0,            # forces a structured latent space
     lambda_asymm=0.5,            # lowered: asymm loss can explode — keep it gentle
     lambda_interval=1.0,         # weight for asymmetric interval score loss
-    interval_alpha: float = 0.05,          # target miscoverage (0.05 → 95% CI)
-    interval_alpha_lo_scale: float = 0.2,  # <0.5 → bias lower bound downward (early preds)
+    interval_alpha: float = 0.05,          # target miscoverage (0.05 -> 95% CI)
+    interval_alpha_lo_scale: float = 0.2,  # <0.5 -> bias lower bound downward (early preds)
     label_noise_std=0.0,
     beta_kl=0.5,                 # regularises GP variational distribution
     grad_clip: float = 1.0,      # max gradient norm — prevents asymm loss explosions
@@ -128,7 +128,7 @@ def train_dkl_autoencoder(
     if seed is not None:
         set_reproducible_seed(int(seed))
 
-    # 1. Inizializza il feature extractor (Autoencoder)
+    # 1. Initialize the feature extractor (Autoencoder)
     feature_extractor = AutoencoderFeatureExtractor(input_dim=input_dim, latent_dim=latent_dim)
 
     # 1b. Warm-up: pre-train the autoencoder on reconstruction only so that
@@ -161,7 +161,7 @@ def train_dkl_autoencoder(
 
 
     # 2. Initialize inducing points in the latent space using K-Means centroids.
-    #    Now collected from a trained encoder → meaningful clusters.
+    #    Now collected from a trained encoder to meaningful clusters.
     latent_embeddings = _collect_latent_embeddings(feature_extractor, train_loader, device=device)
     latent_np = latent_embeddings.numpy()
     n_clusters = min(int(num_inducing), int(latent_np.shape[0]))
@@ -172,14 +172,14 @@ def train_dkl_autoencoder(
         repeat_idx = torch.randint(0, inducing_points.size(0), (num_inducing - inducing_points.size(0),), device=device)
         inducing_points = torch.cat([inducing_points, inducing_points[repeat_idx]], dim=0)
 
-    # 3. Setup del Modello e Likelihood
+    # 3. Setup model and likelihood
     # latent_dim + 1: the GP input is the augmented vector [z (latent_dim) | t (1)].
     # DKLAutoencoderSVGP stores this as self.latent_dim and forwards it to
-    # LatentSpaceSVGP → SpaceTimeKernel so the kernel knows where to split.
+    # LatentSpaceSVGP to SpaceTimeKernel so the kernel knows where to split.
     model = DKLAutoencoderSVGP(feature_extractor, inducing_points, latent_dim + 1)
 
-    # Deriva rul_scale automaticamente dal dataset del loader
-    # (= std dei target RUL in spazio originale, usato per PHM08 e per calibrare il noise)
+    # Derive rul_scale automatically from the loader dataset
+    # (= std of RUL targets in original space, used for PHM08 and noise calibration)
     _dataset = getattr(train_loader, "dataset", None)
     _tt = getattr(_dataset, "target_transform", None) if _dataset is not None else None
     _scaler = getattr(_tt, "scaler", None) if _tt is not None else None
@@ -187,14 +187,14 @@ def train_dkl_autoencoder(
         rul_scale = float(_scaler.scale_[0])
     else:
         rul_scale = 1.0
-        print("[WARNING] rul_scale non derivabile dal loader — PHM08 opera in spazio z.")
+        print("[WARNING] rul_scale could not be derived from the loader — PHM08 operates in z-space.")
 
-    # Noise auto-calibrato dal dataset: target_noise_std_cycles è l'unico
-    # iperparametro interpretabile (std aleatoria in cicli fisici), poi viene
-    # convertito in spazio z dividendo per rul_scale.
-    # Questo garantisce lo stesso significato fisico su tutti i dataset
-    # (FD001/FD002/FD003/FD004) indipendentemente dalla scala del target.
-    _target_noise_std_cycles = 10.0          # ~10 cicli std aleatoria: ragionevole per CMAPSS
+    # Dataset auto-calibrated noise: target_noise_std_cycles is the only
+    # interpretable hyperparameter (random std in physical cycles), then it is
+    # converted to z-space by dividing by rul_scale.
+    # This ensures the same physical meaning across all datasets
+    # (FD001/FD002/FD003/FD004) regardless of target scale.
+    _target_noise_std_cycles = 10.0          # ~10 cycles random std: reasonable for CMAPSS
     _noise_z = (_target_noise_std_cycles / rul_scale) ** 2
 
     likelihood = GaussianLikelihood(
@@ -202,10 +202,10 @@ def train_dkl_autoencoder(
     )
     likelihood.noise = torch.tensor(_noise_z)
     for p in likelihood.parameters():
-        p.requires_grad = False              # noise fisso, non appreso
+        p.requires_grad = False              # fixed noise, not learned
 
-    print(f"RUL scale derivato dal dataset: {rul_scale:.4f}")
-    print(f"Likelihood noise auto-calibrato: {_noise_z:.4f}  (={_target_noise_std_cycles:.1f} cicli std in spazio fisico)")
+    print(f"RUL scale derived from dataset: {rul_scale:.4f}")
+    print(f"Likelihood noise auto-calibrated: {_noise_z:.4f}  (={_target_noise_std_cycles:.1f} cycles std in physical space)")
 
     model.train()
     likelihood.train()
@@ -220,7 +220,7 @@ def train_dkl_autoencoder(
     if gp_lr is None:
         gp_lr = 5e-3
 
-    # Adam per encoder, decoder, kernel hyperparams
+    # Adam for encoder, decoder, and kernel hyperparameters
     optimizer = torch.optim.Adam([
         {'params': feature_extractor.encoder.parameters(), 'lr': encoder_lr},
         {'params': feature_extractor.decoder.parameters(), 'lr': decoder_lr},
@@ -228,7 +228,7 @@ def train_dkl_autoencoder(
     ])
 
 
-    # NGD per i soli parametri variazionali q(u) — aggiornamento Bayesiano
+    # NGD for variational parameters q(u) only — Bayesian update
     ngd_optimizer = NGD(
         model.gp_layer.variational_parameters(),
         num_data=len(train_loader.dataset),
@@ -281,7 +281,7 @@ def train_dkl_autoencoder(
                 x_reconstructed = feature_extractor.reconstruct(x, normalized_cycle=t)
                 loss_recon = F.mse_loss(x_reconstructed, x)
 
-                # PHM08 asymmetric loss in spazio fisico (cicli originali)
+                # PHM08 asymmetric loss in physical space (original cycles)
                 pred_errors = (output.mean - y_noisy.squeeze(-1)) * float(rul_scale)
                 loss_asymm = torch.where(
                     pred_errors < 0,
@@ -289,10 +289,10 @@ def train_dkl_autoencoder(
                     torch.exp(torch.clamp( pred_errors / 10.0, max=10.0)) - 1.0,
                 ).mean()
 
-                # Asymmetric Interval Score — ottimizza direttamente PICP e
-                # larghezza degli intervalli con bias verso early predictions.
-                # Viene calcolata in spazio z (stessa scala dell'output del GP)
-                # per compatibilità con i gradienti dell'ELBO.
+                # Asymmetric Interval Score — directly optimizes PICP and
+                # interval width with a bias toward early predictions.
+                # It is computed in z-space (the same scale as the GP output)
+                # for compatibility with ELBO gradients.
                 pred_std = output.variance.clamp(min=1e-6).sqrt()
                 loss_interval = _interval_score_loss(
                     mean=output.mean,
@@ -304,15 +304,15 @@ def train_dkl_autoencoder(
 
             elbo_loss = -variational_elbo
 
-            # STEP 1: NGD riceve il gradiente dell'ELBO puro (parametri variazionali).
-            # retain_graph=True perché il grafo serve ancora per aux_loss.
+            # STEP 1: NGD receives the pure ELBO gradient (variational parameters).
+            # retain_graph=True because the graph is still needed for aux_loss.
             elbo_loss.backward(retain_graph=True)
             ngd_optimizer.step()
 
-            # STEP 2: Adam aggiorna encoder/decoder/kernel hyperparams su:
-            #   - recon:    mantiene latent space strutturato
-            #   - asymm:    guida le predizioni medie verso early
-            #   - interval: calibra larghezza e copertura degli intervalli
+            # STEP 2: Adam updates encoder/decoder/kernel hyperparameters on:
+            #   - recon:    keeps the latent space structured
+            #   - asymm:    guides mean predictions toward early output
+            #   - interval: calibrates interval width and coverage
             optimizer.zero_grad()
             aux_loss = (
                 lambda_recon      * loss_recon
@@ -320,8 +320,8 @@ def train_dkl_autoencoder(
                 + lambda_interval * loss_interval
             )
             aux_loss.backward()
-            # Gradient clipping: impedisce che l'asymm loss esploda su batch
-            # con errori grandi (es. engine in fase di saturazione RUL).
+            # Gradient clipping: prevents the asymmetric loss from exploding on large batches
+            # with large errors (e.g. engine in RUL saturation phase).
             torch.nn.utils.clip_grad_norm_(
                 [p for group in optimizer.param_groups for p in group["params"]],
                 max_norm=grad_clip,

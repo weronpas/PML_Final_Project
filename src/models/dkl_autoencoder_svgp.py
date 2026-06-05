@@ -7,7 +7,7 @@ import torch.nn as nn
 from gpytorch.means import ConstantMean
 from gpytorch.models import ApproximateGP
 from gpytorch.variational import (
-    NaturalVariationalDistribution,   # sostituisce CholeskyVariationalDistribution
+    NaturalVariationalDistribution,   # replaces CholeskyVariationalDistribution
     VariationalStrategy,
 )
 
@@ -17,7 +17,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
-from src.models.kernels import DegradationKernel, SpaceTimeKernel
+from src.models.kernels import SpaceTimeKernel
 
 
 class Encoder(nn.Module):
@@ -85,8 +85,8 @@ class LatentSpaceSVGP(ApproximateGP):
     """Variational GP operating in the augmented space (latent embedding ‖ time).
 
     Input layout expected by this GP:
-        x[..., :latent_dim]  →  z  (encoder output, scaled to [-1, 1])
-        x[..., latent_dim:]  →  t  (normalised cycle, scalar in [0, 1])
+        x[..., :latent_dim]  ->  z  (encoder output, scaled to [-1, 1])
+        x[..., latent_dim:]  ->  t  (normalised cycle, scalar in [0, 1])
 
     The inducing points must therefore have shape (M, latent_dim + 1).
     SpaceTimeKernel factorises the covariance as k_space(z,z') * k_time(t,t'),
@@ -173,7 +173,7 @@ class DKLAutoencoderSVGP(nn.Module):
         likelihood=None,
         confidence: float = 0.95,
     ):
-        with torch.no_grad(), gpytorch.settings.fast_pred_var(False):  # ← disabilita l'approssimazione
+        with torch.no_grad(), gpytorch.settings.fast_pred_var(False):  # disable the approximation
             posterior = self.forward(x, normalized_cycle=normalized_cycle)
             predictive = likelihood(posterior) if likelihood is not None else posterior
             mean = predictive.mean

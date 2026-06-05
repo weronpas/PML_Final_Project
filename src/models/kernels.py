@@ -24,7 +24,7 @@ class SpaceTimeKernel(gpytorch.kernels.Kernel):
     """
     Product kernel for spatio-temporal GP on degradation data.
 
-    Input layout  →  x[..., :latent_dim] = z   (latent embedding)
+    Input layout  ->  x[..., :latent_dim] = z   (latent embedding)
                      x[..., latent_dim:] = t   (normalised time, [0,1])
 
     k((z,t),(z',t')) = k_space(z,z') * k_time(t,t')
