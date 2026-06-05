@@ -231,7 +231,7 @@ def prediction_interval_coverage(lower_bounds, upper_bounds, true_values):
     ub = np.array(upper_bounds).flatten()
     y  = np.array(true_values).flatten()
     
-    # Esclude campioni con intervalli non validi
+    # Exclude samples with invalid intervals
     valid = np.isfinite(lb) & np.isfinite(ub)
     if not np.any(valid):
         return float('nan')
@@ -244,7 +244,7 @@ def average_interval_width(lower_bounds, upper_bounds):
     lb = np.array(lower_bounds).flatten()
     ub = np.array(upper_bounds).flatten()
     width = ub - lb
-    # Ignora NaN/inf prodotti da saturazione nell'inverse_transform
+    # Ignore NaN/inf produced by saturation in inverse_transform
     valid = np.isfinite(width)
     if not np.any(valid):
         return float('nan')

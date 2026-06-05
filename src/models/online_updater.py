@@ -28,7 +28,6 @@ from src.utils.metrics import (
     evaluate_prognostics_model,
 )
 from src.data.data_loader import StreamingCMAPSSDataset, load_cmapss_data, get_sensor_feature_columns
-from src.models.svgp import RotatingMachinerySVGP
 from src.models.dkl_autoencoder_svgp import DKLAutoencoderSVGP, AutoencoderFeatureExtractor
 
 
@@ -59,8 +58,8 @@ def simulate_online_stream_and_update(
     device: str = "cpu",
     collect_metrics: bool = False,
     rul_scale_factor: float = 1.0,
-    use_natural_gradient: bool = True,   # ← NUOVO: attiva il vero Bayesian online learning
-    ngd_lr: float = 0.1,                 # ← NUOVO: lr per NGD (separato da Adam)
+    use_natural_gradient: bool = True,   # NEW: enable true Bayesian online learning
+    ngd_lr: float = 0.1,                 # NEW: lr for NGD (separate from Adam)
 ):
     """
     Simulates a real-time sensor stream from C-MAPSS data, updating the model 
@@ -81,7 +80,7 @@ def simulate_online_stream_and_update(
     
     
     # ------------------------------------------------------------------ #
-    # Setup optimizer NGD (una volta sola, fuori dal loop)               #
+    # Setup NGD optimizer once, outside the loop                       #
     # ------------------------------------------------------------------ #
     if use_natural_gradient:
         from gpytorch.optim import NGD
@@ -98,7 +97,7 @@ def simulate_online_stream_and_update(
     likelihood.eval()
 
     for batch_idx, batch in enumerate(stream_loader):
-        # --- unpack batch (invariato) ---
+        # --- unpack batch (unchanged) ---
         if len(batch) == 4:
             x_step, y_step, unit_step, t_step = batch
         elif len(batch) == 3:
@@ -114,7 +113,7 @@ def simulate_online_stream_and_update(
             t_step = t_step.to(device)
 
         # ------------------------------------------------------------------ #
-        # 1. PREDIZIONE (invariata)                                           #
+        # 1. PREDICTION (unchanged)                                         #
         # ------------------------------------------------------------------ #
         with torch.no_grad():
             prediction   = model.predict_with_uncertainty(x_step, normalized_cycle=t_step, likelihood=likelihood)
@@ -147,16 +146,16 @@ def simulate_online_stream_and_update(
             metrics_uppers.extend(np.atleast_1d(upper_bound).flatten().tolist())
 
         # ------------------------------------------------------------------ #
-        # 2. AGGIORNAMENTO — qui entra il NGD                                 #
+        # 2. UPDATE — NGD applies here                                      #
         # ------------------------------------------------------------------ #
         if use_natural_gradient:
-            # Congela tutto tranne i parametri variazionali
-            # (encoder, decoder, kernel restano fissi durante lo streaming)
+            # Freeze all except the variational parameters
+            # (encoder, decoder, kernel remain fixed during streaming)
             model.train()
             if is_dkl:
                 model.encoder.eval()
                 model.decoder.eval()
-                # Congela kernel — vuoi solo aggiornare q(u)
+                # Freeze the kernel — only update q(u)
                 for p in target_gp.covar_module.parameters():
                     p.requires_grad_(False)
 
@@ -170,9 +169,9 @@ def simulate_online_stream_and_update(
                 loss = -mll(output, y_step.squeeze(-1))
 
             loss.backward()
-            ngd_optimizer.step()   # ← aggiornamento Bayesiano in forma chiusa
+            ngd_optimizer.step()   # Bayesian update in closed form
 
-            # Ripristina kernel
+            # Restore kernel
             for p in target_gp.covar_module.parameters():
                 p.requires_grad_(True)
 

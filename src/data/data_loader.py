@@ -26,8 +26,8 @@ def inverse_smooth_clip_rul(values, max_rul):
     eps = 1e-8
     values_array = np.asarray(values, dtype=np.float64)
     clipped = np.minimum(values_array, max_rul - eps)
-    arg = max_rul - clipped                        # → quasi 0 per valori vicini a max_rul
-    safe_arg = np.maximum(arg, 1e-7)               # ← clamp prima di expm1
+    arg = max_rul - clipped                        # almost 0 for values near max_rul
+    safe_arg = np.maximum(arg, 1e-7)               # clamp before expm1
     return max_rul - np.log(np.expm1(safe_arg))
 
 
@@ -71,10 +71,10 @@ class SmoothRULTargetTransform:
         if not self.fitted:
             raise RuntimeError("SmoothRULTargetTransform must be fit before calling inverse_transform().")
 
-        # Per gli upper bound degli intervalli di confidenza usiamo un margine
-        # molto più piccolo (0.1 cicli) così il cap non tronca artificialmente
-        # la copertura superiore. Per media e lower bound usiamo CLAMP_MARGIN=2.0
-        # che mantiene la stabilità numerica della derivata.
+        # For upper confidence bounds we use a much smaller margin
+        # (0.1 cycles) so the cap does not artificially truncate upper coverage.
+        # For the mean and lower bound we use CLAMP_MARGIN=2.0
+        # to maintain derivative stability.
         safe_max = self.max_rul - (0.1 if is_upper_bound else self.CLAMP_MARGIN)
 
         if torch.is_tensor(values):
@@ -99,18 +99,18 @@ class SmoothRULTargetTransform:
             return raw_values
 
         variance_array = np.asarray(variance, dtype=np.float64).reshape(-1)
-        # Derivata consistente: valutata sugli stessi smooth_values già clampati
+        # Consistent derivative: evaluated on the same clamped smooth_values
         derivative = self._inverse_derivative_numpy(smooth_values)
         raw_variance = variance_array * (derivative ** 2)
         return raw_values, raw_variance
 
 
     def inverse_interval(self, lower, upper):
-        # Applica inverse_transform indipendentemente su lower e upper
-        # SENZA clampare lower allo stesso valore di upper
+        # Apply inverse_transform independently to lower and upper
+        # WITHOUT clamping lower to the same value as upper
         lower_raw = self.inverse_transform(lower)
         upper_raw = self.inverse_transform(upper)
-        # Se upper è saturato al max, almeno lower può essere più basso
+        # If upper is saturated at the max, lower can still be lower
         return lower_raw, upper_raw
 
     def _inverse_derivative_numpy(self, smooth_values: np.ndarray) -> np.ndarray:
@@ -120,7 +120,7 @@ class SmoothRULTargetTransform:
         deriv_clip = exp_term / np.maximum(exp_term - 1.0, 1e-6)
         deriv_clip = np.minimum(deriv_clip, self.MAX_DERIVATIVE)
         
-        # ✅ Chain rule: includi il fattore dello scaler
+        # Chain rule: include the scaler factor
         full_deriv = deriv_clip * float(self.scaler.scale_[0])
         return full_deriv
 
@@ -132,7 +132,7 @@ class SmoothRULTargetTransform:
         deriv_clip = exp_term / torch.clamp(exp_term - 1.0, min=1e-6)
         deriv_clip = torch.clamp(deriv_clip, max=self.MAX_DERIVATIVE)
 
-        # ✅ Chain rule: includi il fattore dello scaler
+        # Chain rule: include the scaler factor
         scale = torch.as_tensor(float(self.scaler.scale_[0]), dtype=smooth_values.dtype, device=smooth_values.device)
         full_deriv = deriv_clip * scale
         return full_deriv
@@ -258,29 +258,28 @@ class StreamingCMAPSSDataset(Dataset):
     
 class RegimeConditionedScaler:
     """
-    Scaler specializzato per dataset multi-regime (FD002, FD004).
-    Applica KMeans alle colonne operative (setting_1, setting_2, setting_3) 
-    per identificare i 6 regimi. Scala le feature dei sensori in modo 
-    indipendente per ciascun regime, rimuovendo lo scalino causato dal 
-    cambio di altitudine/mach.
+    Specialized scaler for multi-regime datasets (FD002, FD004).
+    Applies KMeans on the operational setting columns (setting_1, setting_2, setting_3)
+    to identify the 6 regimes. It scales sensor features independently for each regime,
+    removing the shift caused by altitude/mach changes.
     """
     def __init__(self, n_regimes: int = 6, setting_cols_indices: tuple = (0, 1, 2)):
         self.n_regimes = n_regimes
         self.setting_cols_indices = setting_cols_indices
-        # n_init=10 garantisce la corretta convergenza sui 6 centroidi esatti
+        # n_init=10 ensures correct convergence to the 6 expected centroids
         self.kmeans = KMeans(n_clusters=n_regimes, random_state=42, n_init=10)
         self.scalers = {i: StandardScaler() for i in range(n_regimes)}
         self.is_fitted = False
 
     def fit(self, X: np.ndarray):
         X_arr = np.asarray(X)
-        # Estrae solo i 3 settings operativi
+        # Extract only the 3 operational settings
         settings = X_arr[:, self.setting_cols_indices]
         
-        # Identifica a quale dei 6 regimi appartiene ogni ciclo
+        # Identify which of the 6 regimes each cycle belongs to
         clusters = self.kmeans.fit_predict(settings)
         
-        # Fitta uno StandardScaler indipendente per ogni regime
+        # Fit an independent StandardScaler for each regime
         for i in range(self.n_regimes):
             mask = (clusters == i)
             if np.sum(mask) > 0:
@@ -295,12 +294,12 @@ class RegimeConditionedScaler:
             
         X_arr = np.asarray(X)
         settings = X_arr[:, self.setting_cols_indices]
-        # Assegna i cicli di test ai regimi imparati in addestramento
+        # Assign test cycles to regimes learned during training
         clusters = self.kmeans.predict(settings)
         
         X_scaled = np.zeros_like(X_arr, dtype=np.float64)
         
-        # Scala ogni ciclo con lo scaler del suo specifico regime
+        # Scale each cycle with the scaler for its specific regime
         for i in range(self.n_regimes):
             mask = (clusters == i)
             if np.sum(mask) > 0:
